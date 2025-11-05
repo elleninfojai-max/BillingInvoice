@@ -423,12 +423,23 @@ const parseXLSX = (file, billingType, resolve, reject) => {
         const headers = rawData[headerRowIndex].map(cell => String(cell || '').trim());
         
         // Don't convert dates - use Excel's formatted text as-is
-        jsonData = cleanedRawData.map(row => {
+        // Get cell values directly to preserve exact format
+        jsonData = cleanedRawData.map((row, rowIdx) => {
           const obj = {};
           headers.forEach((header, idx) => {
             if (header && row[idx] !== null && row[idx] !== undefined) {
-              // Use value as-is (already formatted by Excel)
-              obj[header] = row[idx];
+              // Get cell value directly from worksheet to preserve exact format
+              const cellAddress = XLSX.utils.encode_cell({ r: headerRowIndex + 1 + rowIdx, c: idx });
+              const cell = worksheet[cellAddress];
+              
+              // If cell exists and has formatted text, use it; otherwise use row value
+              if (cell && cell.w) {
+                // cell.w contains the formatted text as displayed in Excel
+                obj[header] = cell.w;
+              } else {
+                // Fallback to row value
+                obj[header] = row[idx];
+              }
             }
           });
           return obj;
@@ -436,10 +447,53 @@ const parseXLSX = (file, billingType, resolve, reject) => {
       } else {
         // Fallback: use default XLSX parsing but filter metadata
         // Use raw: false to get formatted text (as displayed in Excel) instead of raw values
-        const allJsonData = XLSX.utils.sheet_to_json(worksheet, { defval: null, cellDates: false, raw: false });
+        const allJsonData = XLSX.utils.sheet_to_json(worksheet, { 
+          defval: null, 
+          cellDates: false, 
+          raw: false
+        });
+        
+        // Replace values with exact cell formatted text to preserve Excel format
+        // Get all cell addresses from the worksheet
+        const processedJsonData = allJsonData.map((row, rowIdx) => {
+          const processedRow = {};
+          Object.keys(row).forEach((key) => {
+            // Find header row index for this key
+            let headerRowIdx = -1;
+            let colIndex = -1;
+            for (let i = 0; i < rawData.length; i++) {
+              const r = rawData[i];
+              if (r && r.length > 0) {
+                const idx = r.findIndex(cell => String(cell || '').trim() === key);
+                if (idx >= 0) {
+                  headerRowIdx = i;
+                  colIndex = idx;
+                  break;
+                }
+              }
+            }
+            
+            if (colIndex >= 0) {
+              // Calculate actual data row (headerRowIdx + 1 + rowIdx)
+              const actualRowIdx = headerRowIdx + 1 + rowIdx;
+              const cellAddress = XLSX.utils.encode_cell({ r: actualRowIdx, c: colIndex });
+              const cell = worksheet[cellAddress];
+              
+              // Use formatted text from cell if available (cell.w = formatted text as displayed in Excel)
+              if (cell && cell.w) {
+                processedRow[key] = cell.w;
+              } else {
+                processedRow[key] = row[key];
+              }
+            } else {
+              processedRow[key] = row[key];
+            }
+          });
+          return processedRow;
+        });
         
         // Don't convert dates - use Excel's formatted text as-is
-        jsonData = allJsonData.filter(row => {
+        jsonData = processedJsonData.filter(row => {
           const rowValues = Object.values(row).map(v => String(v || '').trim()).filter(v => v.length > 0);
           const rowText = rowValues.join(' ').toLowerCase();
           return !metadataKeywords.some(keyword => rowText.includes(keyword));

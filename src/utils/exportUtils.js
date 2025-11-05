@@ -12,11 +12,14 @@ import {
   Table,
   TableRow,
   TableCell,
-  VerticalAlign
+  VerticalAlign,
+  ImageRun,
+  Media
 } from 'docx';
 import { saveAs } from 'file-saver';
 import JSZip from 'jszip';
 import { generateDOCXBlobDebit } from './exportUtilsDebit';
+import { exportToPDF, generatePDFBlob } from './exportUtilsPDF';
 
 export const exportToCSV = (data, filename = 'invoice-data.csv') => {
   if (!data || data.length === 0) {
@@ -38,10 +41,30 @@ export const exportToXLSX = (data, filename = 'invoice-data.xlsx') => {
     return;
   }
 
-  const ws = XLSX.utils.json_to_sheet(data);
-  const wb = XLSX.utils.book_new();
-  XLSX.utils.book_append_sheet(wb, ws, 'Sheet1');
-  XLSX.writeFile(wb, filename);
+  try {
+    // Ensure data is properly formatted
+    const formattedData = data.map(row => {
+      const formattedRow = {};
+      Object.keys(row).forEach(key => {
+        // Preserve the exact value as it appears in the data
+        formattedRow[key] = row[key] !== null && row[key] !== undefined ? row[key] : '';
+      });
+      return formattedRow;
+    });
+
+    const ws = XLSX.utils.json_to_sheet(formattedData);
+    
+    // Set column widths for better readability
+    const colWidths = Object.keys(formattedData[0] || {}).map(key => ({ wch: Math.max(key.length, 15) }));
+    ws['!cols'] = colWidths;
+    
+    const wb = XLSX.utils.book_new();
+    XLSX.utils.book_append_sheet(wb, ws, 'Sheet1');
+    XLSX.writeFile(wb, filename);
+  } catch (error) {
+    console.error('Error exporting to XLSX:', error);
+    alert('Error exporting to Excel. Please try again.');
+  }
 };
 
 // Helper function to convert number to words (Indian format)
@@ -86,32 +109,15 @@ const numberToWords = (num) => {
   return `Rupee ${amountWords} Only`;
 };
 
-// Helper to format date (handles "30 Oct 2025" format from PDF)
+// Helper to format date - return exactly as it appears in Excel/data without any conversion
 const formatDate = (dateStr) => {
-  if (!dateStr) {
-    const today = new Date();
-    const months = ['Jan', 'Feb', 'Mar', 'Apr', 'May', 'Jun', 'Jul', 'Aug', 'Sep', 'Oct', 'Nov', 'Dec'];
-    return `${today.getDate()} ${months[today.getMonth()]} ${today.getFullYear()}`;
+  if (!dateStr || dateStr === null || dateStr === undefined) {
+    // Only return default if completely empty
+    return '-';
   }
   
-  try {
-    // Check if it's already in "dd MMM yyyy" format (e.g., "30 Oct 2025")
-    const ddmmyyyyMatch = String(dateStr).match(/(\d{1,2})\s+(Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)\s+(\d{4})/i);
-    if (ddmmyyyyMatch) {
-      return `${ddmmyyyyMatch[1]} ${ddmmyyyyMatch[2]} ${ddmmyyyyMatch[3]}`;
-    }
-    
-    // Try standard Date parsing
-    const date = new Date(dateStr);
-    if (!isNaN(date.getTime())) {
-      const months = ['Jan', 'Feb', 'Mar', 'Apr', 'May', 'Jun', 'Jul', 'Aug', 'Sep', 'Oct', 'Nov', 'Dec'];
-      return `${date.getDate()} ${months[date.getMonth()]} ${date.getFullYear()}`;
-    }
-    
-    return String(dateStr);
-  } catch {
-    return String(dateStr);
-  }
+  // Return date exactly as it appears in the source data (Excel format preserved)
+  return String(dateStr);
 };
 
 // Helper to get amount value (prioritizes credit for invoices, then debit)
@@ -183,16 +189,50 @@ const isCreditTransaction = (row) => {
   return true;
 };
 
+// Extract last part from serial number (e.g., "001" from "ELLEN/UPI/2025/001")
+const extractSerialNumberSequence = (serialNumber) => {
+  if (!serialNumber) return null;
+  const serialStr = String(serialNumber).trim();
+  
+  // Extract last part after last "/"
+  const parts = serialStr.split('/');
+  if (parts.length > 0) {
+    const lastPart = parts[parts.length - 1].trim();
+    // If it's just numbers, return padded to 3 digits
+    if (/^\d+$/.test(lastPart)) {
+      return lastPart.padStart(3, '0');
+    }
+  }
+  
+  // Fallback: try to extract last sequence of digits
+  const match = serialStr.match(/(\d+)$/);
+  if (match && match[1]) {
+    return match[1].padStart(3, '0');
+  }
+  
+  return null;
+};
+
 // Generate invoice number based on sequential numbering (format: ELLEN/UPI/2025/001)
-const generateInvoiceNumber = (invoiceCounter) => {
-  // Track global invoice counter
+// If serialNumber is provided, extract sequence from it; otherwise use counter
+const generateInvoiceNumber = (invoiceCounter, serialNumber = null) => {
+  const currentYear = new Date().getFullYear();
+  
+  // If serial number is provided, extract sequence from it
+  if (serialNumber) {
+    const extractedSequence = extractSerialNumberSequence(serialNumber);
+    if (extractedSequence) {
+      return `ELLEN/UPI/${currentYear}/${extractedSequence}`;
+    }
+  }
+  
+  // Fallback to counter-based generation
   if (!invoiceCounter.count) {
     invoiceCounter.count = 0;
   }
   invoiceCounter.count++;
   
   const sequence = String(invoiceCounter.count).padStart(3, '0');
-  const currentYear = new Date().getFullYear();
   return `ELLEN/UPI/${currentYear}/${sequence}`;
 };
 
@@ -280,6 +320,32 @@ export const exportToDOCX = async (data, billingType, transactionType = 'all', f
   const BATCH_SIZE = 50;
   const batches = Math.ceil(data.length / BATCH_SIZE);
 
+  // Load logo image once (for all receipts)
+  let logoData = null;
+  try {
+    // Try to load logo from assets folder
+    const logoResponse = await fetch('/src/assets/images/logo.jpg');
+    if (logoResponse.ok) {
+      logoData = await logoResponse.arrayBuffer();
+    }
+  } catch (error) {
+    // Try alternative paths
+    try {
+      const altResponse = await fetch('/assets/images/logo.jpg');
+      if (altResponse.ok) {
+        logoData = await altResponse.arrayBuffer();
+      } else {
+        // Try public folder
+        const pubResponse = await fetch('/logo.jpg');
+        if (pubResponse.ok) {
+          logoData = await pubResponse.arrayBuffer();
+        }
+      }
+    } catch (err) {
+      console.warn('Logo image not found, continuing without logo');
+    }
+  }
+
   for (let batchIndex = 0; batchIndex < batches; batchIndex++) {
     const startIndex = batchIndex * BATCH_SIZE;
     const endIndex = Math.min(startIndex + BATCH_SIZE, data.length);
@@ -290,23 +356,80 @@ export const exportToDOCX = async (data, billingType, transactionType = 'all', f
     // Process each record as individual invoice/voucher
     for (let i = 0; i < batchData.length; i++) {
       const row = batchData[i];
+      
+      // Debug: Log row data to help identify issues
+      console.log('Processing row:', row);
+      
       const amount = getAmount(row);
       const amountInWords = numberToWords(Math.floor(amount));
       
-      // Get date from various possible column names
-      const dateKeys = ['date', 'txndate', 'transactiondate', 'paymentdate', 'valuedate'];
-      const dateKey = Object.keys(row).find(key => 
+      // Get serial number from row data
+      const serialNoKeys = ['serialno', 'serialnumber', 'serial no', 's.no', 'sno', 'serialno'];
+      const serialNoKey = Object.keys(row).find(key => 
+        serialNoKeys.some(sk => key.toLowerCase().replace(/[^a-z0-9]/g, '').includes(sk.toLowerCase().replace(/[^a-z0-9]/g, '')))
+      );
+      const serialNumber = serialNoKey ? String(row[serialNoKey] || '').trim() : '';
+
+      // Get date from various possible column names (try multiple date columns)
+      const dateKeys = ['date', 'txndate', 'transactiondate', 'paymentdate', 'valuedate', 'transaction date', 'value date'];
+      let dateKey = Object.keys(row).find(key => 
         dateKeys.some(dk => key.toLowerCase().includes(dk.toLowerCase()))
       );
-      const invoiceDate = formatDate(row[dateKey] || new Date());
+      
+      // If no date key found, try to find any column that looks like a date (contains date pattern)
+      if (!dateKey) {
+        for (const key of Object.keys(row)) {
+          const value = String(row[key] || '').trim();
+          // Check if value looks like a date (e.g., "3/11/25", "11/3/25", etc.)
+          if (value.match(/^\d{1,2}[\/\-]\d{1,2}[\/\-]\d{2,4}$/)) {
+            dateKey = key;
+            break;
+          }
+        }
+      }
+      
+      const invoiceDate = formatDate(row[dateKey] || null);
 
       // Get description to extract client/payer and payment details
-      const descKey = Object.keys(row).find(key => 
-        key.toLowerCase().includes('description') || 
-        key.toLowerCase().includes('particulars') ||
-        key.toLowerCase().includes('narration')
+      // Try multiple possible column names for description
+      const descKeys = ['description', 'particulars', 'narration', 'details', 'remarks', 'note', 'transaction details', 'narration'];
+      let descKey = Object.keys(row).find(key => 
+        descKeys.some(dk => key.toLowerCase().includes(dk.toLowerCase()))
       );
-      const description = descKey ? String(row[descKey] || '') : '';
+      
+      // If no description key found, try to find column with longest text content (likely description)
+      if (!descKey) {
+        let maxLength = 0;
+        for (const key of Object.keys(row)) {
+          const value = String(row[key] || '').trim();
+          // Skip if it's a date, number, serial number, or empty
+          if (value && 
+              !value.match(/^\d{1,2}[\/\-]\d{1,2}[\/\-]\d{2,4}$/) && 
+              !value.match(/^\-?\d+[.,]?\d*$/) && 
+              !value.match(/^[A-Z]+\/\d+\/\d+\/\d+$/) &&
+              !value.match(/^[\/\-\s]+$/)) { // Skip if it's just separators like "- / -"
+            if (value.length > maxLength && value.length > 10) {
+              maxLength = value.length;
+              descKey = key;
+            }
+          }
+        }
+      }
+      
+      // Get description - preserve full text including special characters
+      const description = descKey ? String(row[descKey] || '').trim() : '';
+      
+      // Debug: Log extracted values (only in development)
+      if (process.env.NODE_ENV === 'development') {
+        console.log('Extracted values:', {
+          dateKey,
+          invoiceDate,
+          descKey,
+          description,
+          amount,
+          serialNumber
+        });
+      }
 
       // Extract client/payer name from description
       // Pattern: "Tacklerz Innovations / tgpradz3@ybl" or similar
@@ -349,8 +472,9 @@ export const exportToDOCX = async (data, billingType, transactionType = 'all', f
       const isCredit = isCreditTransaction(row);
       
       // Generate invoice/voucher number (only increment counter for credit transactions)
+      // Use serial number if available to extract sequence
       const invoiceNumber = isCredit 
-        ? generateInvoiceNumber(invoiceCounter)
+        ? generateInvoiceNumber(invoiceCounter, serialNumber)
         : generateVoucherNumber(partyName, startIndex + i, payeeNameMap);
 
       // Get Ref No from various columns
@@ -364,216 +488,527 @@ export const exportToDOCX = async (data, billingType, transactionType = 'all', f
       const paymentMode = detectPaymentMode(description, refNo);
 
       if (isCredit) {
-        // INVOICE FORMAT (Credit/Student Fee Collection) - Line by line format
+        // PAYMENT RECEIPT FORMAT (Credit/Student Fee Collection) - Exact template matching image
+        // Get description for "Received from Payer (Name and Details)"
+        const payerDetails = description || partyName || '-';
+        
         children.push(
-          // Company Name (with page break before for new invoices)
+          // Page break before for new receipts (except first)
           new Paragraph({
-            children: [
-              new TextRun({
-                text: companyName,
-                bold: true,
-                size: 28,
-              }),
-            ],
-            alignment: AlignmentType.LEFT,
-            spacing: { after: 200 },
-            pageBreakBefore: i > 0 || batchIndex > 0, // Start new page for each invoice except the first one
+            children: [new TextRun({ text: '' })],
+            pageBreakBefore: i > 0 || batchIndex > 0,
+            spacing: { after: 0, before: 0 },
           }),
-          // GSTIN
-          new Paragraph({
-            children: [
-              new TextRun({
-                text: `GSTIN : ${companyGSTIN}`,
-                size: 22,
+          
+          // Header Section with Logo and Contact Info (using Table for side-by-side layout, no borders)
+          new Table({
+            width: { size: 100, type: WidthType.PERCENTAGE },
+            borders: {
+              top: {
+                size: 0,
+                style: BorderStyle.NONE,
+              },
+              bottom: {
+                size: 0,
+                style: BorderStyle.NONE,
+              },
+              left: {
+                size: 0,
+                style: BorderStyle.NONE,
+              },
+              right: {
+                size: 0,
+                style: BorderStyle.NONE,
+              },
+              insideHorizontal: {
+                size: 0,
+                style: BorderStyle.NONE,
+              },
+              insideVertical: {
+                size: 0,
+                style: BorderStyle.NONE,
+              },
+            },
+            rows: [
+              new TableRow({
+                children: [
+                  // Left Column: Logo and LEARNSCONNECT
+                  new TableCell({
+                    borders: {
+                      top: { size: 0, style: BorderStyle.NONE },
+                      bottom: { size: 0, style: BorderStyle.NONE },
+                      left: { size: 0, style: BorderStyle.NONE },
+                      right: { size: 0, style: BorderStyle.NONE },
+                    },
+                    children: [
+                      // Logo Image at the top
+                      ...(logoData ? [
+                        new Paragraph({
+                          children: [
+                            new ImageRun({
+                              data: new Uint8Array(logoData),
+                              transformation: {
+                                width: 80,
+                                height: 80,
+                              },
+                            }),
+                          ],
+                          alignment: AlignmentType.LEFT,
+                          spacing: { after: 80, before: 0 },
+                        }),
+                      ] : []),
+                      // LEARNSCONNECT Branding
+                      new Paragraph({
+                        children: [
+                          new TextRun({
+                            text: 'LEARNSCONNECT',
+                            bold: true,
+                            size: 28,
+                            color: '0000FF',
+                          }),
+                        ],
+                        alignment: AlignmentType.LEFT,
+                        spacing: { after: 30 },
+                      }),
+                      // Tagline
+                      new Paragraph({
+                        children: [
+                          new TextRun({
+                            text: 'WHERE LEARNING MEETS OPPORTUNITY',
+                            size: 20,
+                            color: '333333',
+                            bold: true,
+                            font: 'Calibri',
+                          }),
+                        ],
+                        alignment: AlignmentType.LEFT,
+                        spacing: { after: 0 },
+                      }),
+                    ],
+                    width: { size: 50, type: WidthType.PERCENTAGE },
+                    verticalAlign: VerticalAlign.TOP,
+                  }),
+                  // Right Column: Contact Information
+                  new TableCell({
+                    borders: {
+                      top: { size: 0, style: BorderStyle.NONE },
+                      bottom: { size: 0, style: BorderStyle.NONE },
+                      left: { size: 0, style: BorderStyle.NONE },
+                      right: { size: 0, style: BorderStyle.NONE },
+                    },
+                    children: [
+                      // Address
+                      new Paragraph({
+                        children: [
+                          new TextRun({
+                            text: '8/3, Athreyapuram 2nd Street, Choolaimedu, Chennai - 600094',
+                            size: 22,
+                            font: 'Calibri',
+                          }),
+                        ],
+                        alignment: AlignmentType.RIGHT,
+                        spacing: { after: 60, before: 0 },
+                      }),
+                      // Phone
+                      new Paragraph({
+                        children: [
+                          new TextRun({
+                            text: '📞 +91 84893 57705',
+                            size: 22,
+                            font: 'Calibri',
+                          }),
+                        ],
+                        alignment: AlignmentType.RIGHT,
+                        spacing: { after: 60 },
+                      }),
+                      // Email
+                      new Paragraph({
+                        children: [
+                          new TextRun({
+                            text: '✉ support@learnsconnect.com',
+                            size: 22,
+                            font: 'Calibri',
+                          }),
+                        ],
+                        alignment: AlignmentType.RIGHT,
+                        spacing: { after: 60 },
+                      }),
+                      // Website
+                      new Paragraph({
+                        children: [
+                          new TextRun({
+                            text: '🌐 www.learnsconnect.com',
+                            size: 22,
+                            font: 'Calibri',
+                          }),
+                        ],
+                        alignment: AlignmentType.RIGHT,
+                        spacing: { after: 0 },
+                      }),
+                    ],
+                    width: { size: 50, type: WidthType.PERCENTAGE },
+                    verticalAlign: VerticalAlign.TOP,
+                  }),
+                ],
               }),
             ],
-            alignment: AlignmentType.LEFT,
-            spacing: { after: 100 },
           }),
-          // Address
+          
+          // Spacing after header table (compact)
           new Paragraph({
-            children: [
-              new TextRun({
-                text: companyAddress,
-                size: 22,
-              }),
-            ],
-            alignment: AlignmentType.LEFT,
-            spacing: { after: 100 },
-          }),
-          // Email
-          new Paragraph({
-            children: [
-              new TextRun({
-                text: companyEmail,
-                size: 22,
-              }),
-            ],
-            alignment: AlignmentType.LEFT,
-            spacing: { after: 100 },
-          }),
-          // Phone
-          new Paragraph({
-            children: [
-              new TextRun({
-                text: companyPhone,
-                size: 22,
-              }),
-            ],
-            alignment: AlignmentType.LEFT,
-            spacing: { after: 400 },
+            children: [new TextRun({ text: '' })],
+            spacing: { after: 150 },
           }),
 
-          // Dividing Line
+          // Company Name - Centered, Bold, Uppercase
+          new Paragraph({
+            children: [
+              new TextRun({
+                text: 'ELLEN INFORMATION TECHNOLOGY SOLUTIONS PRIVATE LIMITED',
+                bold: true,
+                size: 22,
+              }),
+            ],
+            alignment: AlignmentType.CENTER,
+            spacing: { after: 200 },
+          }),
+          
+          // Teal Separator Line (using underline or border effect)
           new Paragraph({
             children: [
               new TextRun({
                 text: '________________________________________________________________________________',
                 size: 22,
-              }),
-            ],
-            alignment: AlignmentType.LEFT,
-            spacing: { after: 400 },
-          }),
-
-          // Invoice Title
-          new Paragraph({
-            children: [
-              new TextRun({
-                text: 'INVOICE',
-                bold: true,
-                size: 32,
+                color: '008080', // Teal color
               }),
             ],
             alignment: AlignmentType.CENTER,
             spacing: { after: 400 },
           }),
 
-          // Invoice Number - Line by line
+          // Payment Receipt Title - "LearnsConnect – Payment Receipt" (centered, bold, larger font)
           new Paragraph({
             children: [
               new TextRun({
-                text: 'Invoice Number: ',
+                text: 'LearnsConnect – Payment Receipt',
                 bold: true,
-                size: 22,
-              }),
-              new TextRun({
-                text: invoiceNumber,
-                size: 22,
+                size: 32,
               }),
             ],
-            spacing: { after: 200 },
+            alignment: AlignmentType.CENTER,
+            spacing: { after: 600 },
           }),
 
-          // Date - Line by line
-          new Paragraph({
-            children: [
-              new TextRun({
-                text: 'Date: ',
-                bold: true,
-                size: 22,
+          // Payment Receipt Content - Table format for proper alignment
+          new Table({
+            width: { size: 100, type: WidthType.PERCENTAGE },
+            borders: {
+              top: { size: 0, style: BorderStyle.NONE },
+              bottom: { size: 0, style: BorderStyle.NONE },
+              left: { size: 0, style: BorderStyle.NONE },
+              right: { size: 0, style: BorderStyle.NONE },
+              insideHorizontal: { size: 0, style: BorderStyle.NONE },
+              insideVertical: { size: 0, style: BorderStyle.NONE },
+            },
+            rows: [
+              // Payment Receipt Voucher No.
+              new TableRow({
+                children: [
+                  new TableCell({
+                    children: [
+                      new Paragraph({
+                        children: [
+                          new TextRun({
+                            text: 'Payment Receipt Voucher No.:',
+                            bold: true,
+                            size: 22,
+                          }),
+                        ],
+                        spacing: { after: 200 },
+                      }),
+                    ],
+                    width: { size: 40, type: WidthType.PERCENTAGE },
+                    verticalAlign: VerticalAlign.TOP,
+                  }),
+                  new TableCell({
+                    children: [
+                      new Paragraph({
+                        children: [
+                          new TextRun({
+                            text: invoiceNumber || '-',
+                            size: 22,
+                          }),
+                        ],
+                        spacing: { after: 200 },
+                      }),
+                    ],
+                    width: { size: 60, type: WidthType.PERCENTAGE },
+                    verticalAlign: VerticalAlign.TOP,
+                  }),
+                ],
               }),
-              new TextRun({
-                text: invoiceDate || '-',
-                size: 22,
+              // Date
+              new TableRow({
+                children: [
+                  new TableCell({
+                    children: [
+                      new Paragraph({
+                        children: [
+                          new TextRun({
+                            text: 'Date:',
+                            bold: true,
+                            size: 22,
+                          }),
+                        ],
+                        spacing: { after: 200 },
+                      }),
+                    ],
+                    width: { size: 40, type: WidthType.PERCENTAGE },
+                    verticalAlign: VerticalAlign.TOP,
+                  }),
+                  new TableCell({
+                    children: [
+                      new Paragraph({
+                        children: [
+                          new TextRun({
+                            text: invoiceDate || '-',
+                            size: 22,
+                          }),
+                        ],
+                        spacing: { after: 200 },
+                      }),
+                    ],
+                    width: { size: 60, type: WidthType.PERCENTAGE },
+                    verticalAlign: VerticalAlign.TOP,
+                  }),
+                ],
+              }),
+              // Mode of Payment
+              new TableRow({
+                children: [
+                  new TableCell({
+                    children: [
+                      new Paragraph({
+                        children: [
+                          new TextRun({
+                            text: 'Mode of Payment:',
+                            bold: true,
+                            size: 22,
+                          }),
+                        ],
+                        spacing: { after: 200 },
+                      }),
+                    ],
+                    width: { size: 40, type: WidthType.PERCENTAGE },
+                    verticalAlign: VerticalAlign.TOP,
+                  }),
+                  new TableCell({
+                    children: [
+                      new Paragraph({
+                        children: [
+                          new TextRun({
+                            text: 'UPI',
+                            size: 22,
+                          }),
+                        ],
+                        spacing: { after: 200 },
+                      }),
+                    ],
+                    width: { size: 60, type: WidthType.PERCENTAGE },
+                    verticalAlign: VerticalAlign.TOP,
+                  }),
+                ],
+              }),
+              // Received from Payer (Name and Details)
+              new TableRow({
+                children: [
+                  new TableCell({
+                    children: [
+                      new Paragraph({
+                        children: [
+                          new TextRun({
+                            text: 'Received from Payer (Name and Details):',
+                            bold: true,
+                            size: 22,
+                          }),
+                        ],
+                        spacing: { after: 200 },
+                      }),
+                    ],
+                    width: { size: 40, type: WidthType.PERCENTAGE },
+                    verticalAlign: VerticalAlign.TOP,
+                  }),
+                  new TableCell({
+                    children: [
+                      new Paragraph({
+                        children: [
+                          new TextRun({
+                            text: payerDetails,
+                            size: 22,
+                          }),
+                        ],
+                        spacing: { after: 200 },
+                      }),
+                    ],
+                    width: { size: 60, type: WidthType.PERCENTAGE },
+                    verticalAlign: VerticalAlign.TOP,
+                  }),
+                ],
+              }),
+              // Purpose of Payment
+              new TableRow({
+                children: [
+                  new TableCell({
+                    children: [
+                      new Paragraph({
+                        children: [
+                          new TextRun({
+                            text: 'Purpose of Payment:',
+                            bold: true,
+                            size: 22,
+                          }),
+                        ],
+                        spacing: { after: 200 },
+                      }),
+                    ],
+                    width: { size: 40, type: WidthType.PERCENTAGE },
+                    verticalAlign: VerticalAlign.TOP,
+                  }),
+                  new TableCell({
+                    children: [
+                      new Paragraph({
+                        children: [
+                          new TextRun({
+                            text: 'Payment collected from students for Course/Batch',
+                            size: 22,
+                          }),
+                        ],
+                        spacing: { after: 200 },
+                      }),
+                    ],
+                    width: { size: 60, type: WidthType.PERCENTAGE },
+                    verticalAlign: VerticalAlign.TOP,
+                  }),
+                ],
+              }),
+              // Amount (₹)
+              new TableRow({
+                children: [
+                  new TableCell({
+                    children: [
+                      new Paragraph({
+                        children: [
+                          new TextRun({
+                            text: 'Amount (₹):',
+                            bold: true,
+                            size: 22,
+                          }),
+                        ],
+                        spacing: { after: 400 },
+                      }),
+                    ],
+                    width: { size: 40, type: WidthType.PERCENTAGE },
+                    verticalAlign: VerticalAlign.TOP,
+                  }),
+                  new TableCell({
+                    children: [
+                      new Paragraph({
+                        children: [
+                          new TextRun({
+                            text: `₹ ${amount.toLocaleString('en-IN', { minimumFractionDigits: 2, maximumFractionDigits: 2 })}`,
+                            size: 22,
+                            bold: true,
+                          }),
+                        ],
+                        spacing: { after: 400 },
+                      }),
+                    ],
+                    width: { size: 60, type: WidthType.PERCENTAGE },
+                    verticalAlign: VerticalAlign.TOP,
+                  }),
+                ],
+              }),
+              // Amount in Words
+              new TableRow({
+                children: [
+                  new TableCell({
+                    children: [
+                      new Paragraph({
+                        children: [
+                          new TextRun({
+                            text: 'Amount in Words:',
+                            bold: true,
+                            size: 22,
+                          }),
+                        ],
+                        spacing: { after: 800 },
+                      }),
+                    ],
+                    width: { size: 40, type: WidthType.PERCENTAGE },
+                    verticalAlign: VerticalAlign.TOP,
+                  }),
+                  new TableCell({
+                    children: [
+                      new Paragraph({
+                        children: [
+                          new TextRun({
+                            text: amountInWords,
+                            size: 22,
+                          }),
+                        ],
+                        spacing: { after: 800 },
+                      }),
+                    ],
+                    width: { size: 60, type: WidthType.PERCENTAGE },
+                    verticalAlign: VerticalAlign.TOP,
+                  }),
+                ],
               }),
             ],
-            spacing: { after: 200 },
           }),
 
-          // Payment Mode - Line by line
+          // Spacer to push footer 2.5 inches + 3 pixels down (3600 + 45 = 3645 twips)
+          new Paragraph({
+            children: [new TextRun({ text: '' })],
+            spacing: { before: 3645, after: 0 }, // 2.5 inches + 3 pixels = 3645 twips
+          }),
+
+          // Footer Disclaimer (matching image exactly)
           new Paragraph({
             children: [
               new TextRun({
-                text: 'Payment Mode: ',
-                bold: true,
-                size: 22,
-              }),
-              new TextRun({
-                text: paymentMode || '-',
-                size: 22,
-              }),
-            ],
-            spacing: { after: 200 },
-          }),
-
-          // Client / Payer - Line by line
-          new Paragraph({
-            children: [
-              new TextRun({
-                text: 'Client / Payer: ',
-                bold: true,
-                size: 22,
-              }),
-              new TextRun({
-                text: partyName || '-',
-                size: 22,
-              }),
-            ],
-            spacing: { after: 200 },
-          }),
-
-          // Nature of Payment - Always "Course Fee / Lead Fee"
-          new Paragraph({
-            children: [
-              new TextRun({
-                text: 'Nature of Payment: ',
-                bold: true,
-                size: 22,
-              }),
-              new TextRun({
-                text: 'Course Fee / Lead Fee',
-                size: 22,
-              }),
-            ],
-            spacing: { after: 200 },
-          }),
-
-          // Total (INR) - Line by line
-          new Paragraph({
-            children: [
-              new TextRun({
-                text: 'Total (INR): ',
-                bold: true,
-                size: 22,
-              }),
-              new TextRun({
-                text: `₹ ${amount.toLocaleString('en-IN', { minimumFractionDigits: 2, maximumFractionDigits: 2 })}`,
-                size: 22,
-                bold: true,
-              }),
-            ],
-            spacing: { after: 400 },
-          }),
-
-          // Amount in Words
-          new Paragraph({
-            children: [
-              new TextRun({
-                text: `Amount in Words: ${amountInWords}`,
-                size: 22,
-              }),
-            ],
-            spacing: { after: 800 },
-          }),
-
-          // Footer Disclaimer
-          new Paragraph({
-            children: [
-              new TextRun({
-                text: 'All payments are made via SBI RTGS/NEFT from Ellen Information Technology Solutions Pvt. Ltd. (A/c No. ending 5037) towards business services rendered under the LearnsConnect operations. Each transfer is supported by work orders, GST invoices, and digital approval records.',
+                text: 'This receipt is computer generated by for acknowledgement of payment received. Non-refundable unless of technical issues. All disputes subject to Chennai jurisdiction.',
                 size: 18,
                 italics: true,
+                color: '808080', // Gray color
               }),
             ],
             alignment: AlignmentType.LEFT,
-            spacing: { before: 400, after: 400 },
+            spacing: { before: 0, after: 200 },
           }),
-          // Page break after invoice (ensures next invoice starts on new page)
+          
+          // Bottom Teal Border Line (matching image)
           new Paragraph({
-            children: [new TextRun({ text: '', break: 1 })],
+            children: [
+              new TextRun({
+                text: '________________________________________________________________________________',
+                size: 22,
+                color: '008080', // Teal color
+              }),
+            ],
+            alignment: AlignmentType.CENTER,
+            spacing: { after: 200 },
           }),
         );
+        
+        // Add page break after receipt (except for last receipt in last batch)
+        if (!(i === batchData.length - 1 && batchIndex === batches - 1)) {
+          children.push(
+            new Paragraph({
+              children: [new TextRun({ text: '', break: 1 })],
+            })
+          );
+        }
       } else {
         // PAYMENT VOUCHER FORMAT (Debit/Fees Paid to Tutors)
         children.push(
@@ -809,8 +1244,24 @@ export const exportToDOCX = async (data, billingType, transactionType = 'all', f
       }
     }
 
+    // Ensure we have content before creating document
+    if (children.length === 0) {
+      console.warn('No content to export');
+      return;
+    }
+
     const doc = new Document({
       sections: [{
+        properties: {
+          page: {
+            margin: {
+              top: 720, // 0.5 inch in twips (reduced from 1 inch for no top space)
+              right: 1440,
+              bottom: 1440,
+              left: 1440,
+            },
+          },
+        },
         children,
       }],
     });
@@ -896,6 +1347,13 @@ export const exportToDOCXMixed = async (data, billingType, filename = 'invoice-m
     const amount = getAmount(row);
     const amountInWords = numberToWords(Math.floor(amount));
     
+    // Get serial number from row data
+    const serialNoKeys = ['serialno', 'serialnumber', 'serial no', 's.no', 'sno'];
+    const serialNoKey = Object.keys(row).find(key => 
+      serialNoKeys.some(sk => key.toLowerCase().replace(/[^a-z0-9]/g, '').includes(sk.toLowerCase().replace(/[^a-z0-9]/g, '')))
+    );
+    const serialNumber = serialNoKey ? String(row[serialNoKey] || '') : '';
+    
     const dateKeys = ['date', 'txndate', 'transactiondate', 'paymentdate', 'valuedate'];
     const dateKey = Object.keys(row).find(key => 
       dateKeys.some(dk => key.toLowerCase().includes(dk.toLowerCase()))
@@ -924,7 +1382,7 @@ export const exportToDOCXMixed = async (data, billingType, filename = 'invoice-m
       }
     }
 
-    const invoiceNumber = generateInvoiceNumber(invoiceCounter);
+    const invoiceNumber = generateInvoiceNumber(invoiceCounter, serialNumber);
     const paymentMode = detectPaymentMode(description, row);
 
     // Get Ref No
@@ -1012,7 +1470,7 @@ export const exportToDOCXMixed = async (data, billingType, filename = 'invoice-m
       new Paragraph({
         children: [
           new TextRun({
-            text: 'INVOICE',
+            text: 'PAYMENT RECEIPT',
             bold: true,
             size: 32,
           }),
@@ -1023,7 +1481,7 @@ export const exportToDOCXMixed = async (data, billingType, filename = 'invoice-m
       new Paragraph({
         children: [
           new TextRun({
-            text: 'Invoice Number: ',
+            text: 'Payment Receipt Voucher No.: ',
             bold: true,
             size: 22,
           }),
@@ -1051,12 +1509,12 @@ export const exportToDOCXMixed = async (data, billingType, filename = 'invoice-m
       new Paragraph({
         children: [
           new TextRun({
-            text: 'Payment Mode: ',
+            text: 'Mode of Payment: ',
             bold: true,
             size: 22,
           }),
           new TextRun({
-            text: paymentMode || 'UPI',
+            text: 'UPI',
             size: 22,
           }),
         ],
@@ -1065,12 +1523,12 @@ export const exportToDOCXMixed = async (data, billingType, filename = 'invoice-m
       new Paragraph({
         children: [
           new TextRun({
-            text: 'Client / Payer: ',
+            text: 'Received from Payer (Name and Details): ',
             bold: true,
             size: 22,
           }),
           new TextRun({
-            text: partyName || '-',
+            text: description || partyName || '-',
             size: 22,
           }),
         ],
@@ -1079,12 +1537,12 @@ export const exportToDOCXMixed = async (data, billingType, filename = 'invoice-m
       new Paragraph({
         children: [
           new TextRun({
-            text: 'Nature of Payment: ',
+            text: 'Purpose of Payment: ',
             bold: true,
             size: 22,
           }),
           new TextRun({
-            text: 'Course Fee / Lead Fee',
+            text: 'Payment collected from students for Course/Batch',
             size: 22,
           }),
         ],
@@ -1093,7 +1551,7 @@ export const exportToDOCXMixed = async (data, billingType, filename = 'invoice-m
       new Paragraph({
         children: [
           new TextRun({
-            text: 'Total (INR): ',
+            text: 'Amount (₹): ',
             bold: true,
             size: 22,
           }),
@@ -1141,6 +1599,13 @@ export const exportToDOCXMixed = async (data, billingType, filename = 'invoice-m
   // Generate debit vouchers inline
   for (let i = 0; i < debitRows.length; i++) {
     const row = debitRows[i];
+    
+    // Get serial number from row data
+    const serialNoKeys = ['serialno', 'serialnumber', 'serial no', 's.no', 'sno'];
+    const serialNoKey = Object.keys(row).find(key => 
+      serialNoKeys.some(sk => key.toLowerCase().replace(/[^a-z0-9]/g, '').includes(sk.toLowerCase().replace(/[^a-z0-9]/g, '')))
+    );
+    const serialNumber = serialNoKey ? String(row[serialNoKey] || '') : '';
     
     const debitAmount = getDebitAmount(row);
     const amountInWords = numberToWords(Math.floor(debitAmount));
@@ -1277,6 +1742,23 @@ export const exportToDOCXMixed = async (data, billingType, filename = 'invoice-m
         ],
         spacing: { after: 200 },
       }),
+      // Serial Number - Line by line (if available)
+      ...(serialNumber ? [
+        new Paragraph({
+          children: [
+            new TextRun({
+              text: 'Serial Number: ',
+              bold: true,
+              size: 22,
+            }),
+            new TextRun({
+              text: serialNumber,
+              size: 22,
+            }),
+          ],
+          spacing: { after: 200 },
+        }),
+      ] : []),
       new Paragraph({
         children: [
           new TextRun({
@@ -1553,8 +2035,60 @@ const detectIsDebit = (dataToCheck) => {
       const hasDebit = debitRows.length > 0;
       const isMixed = hasCredit && hasDebit;
 
-      const BATCH_SIZE = 50;
+      // Generate individual PDF files for each record
+      // Process all records (credit and debit) in order
+      const allRows = [...data]; // Keep original order
+      
+      for (let i = 0; i < allRows.length; i++) {
+        const row = allRows[i];
+        
+        // Determine if this is credit or debit
+        let isRowCredit = false;
+        let isRowDebit = false;
+        
+        for (const key of Object.keys(row)) {
+          const normalizedKey = key.toLowerCase().replace(/[^a-z0-9]/g, '');
+          const value = row[key];
+          
+          if ((normalizedKey.includes('credit') || normalizedKey.includes('cr')) && 
+              value && String(value).trim() && !isNaN(parseFloat(String(value).replace(/[^\d.,-]/g, '').replace(/,/g, '')))) {
+            const amt = parseFloat(String(value).replace(/[^\d.,-]/g, '').replace(/,/g, ''));
+            if (amt > 0) {
+              isRowCredit = true;
+              break;
+            }
+          }
+        }
+        
+        if (!isRowCredit) {
+          for (const key of Object.keys(row)) {
+            const normalizedKey = key.toLowerCase().replace(/[^a-z0-9]/g, '');
+            const value = row[key];
+            
+            if ((normalizedKey.includes('debit') || normalizedKey.includes('dr')) && 
+                value && String(value).trim() && !isNaN(parseFloat(String(value).replace(/[^\d.,-]/g, '').replace(/,/g, '')))) {
+              const amt = parseFloat(String(value).replace(/[^\d.,-]/g, '').replace(/,/g, ''));
+              if (amt > 0) {
+                isRowDebit = true;
+                break;
+              }
+            }
+          }
+        }
+        
+        // Generate PDF for this single record
+        const singleRecordData = [row];
+        const pdfBuffer = await generatePDFBlob(singleRecordData, billingType, transactionType);
+        
+        if (pdfBuffer) {
+          // Generate filename based on record type and index
+          const recordType = isRowCredit ? 'Payment-Receipt' : 'Vendor-Invoice';
+          const pdfFilename = `${recordType}-${timestamp}-${String(i + 1).padStart(3, '0')}.pdf`;
+          zip.file(pdfFilename, pdfBuffer);
+        }
+      }
 
+      /* Old DOCX generation code removed - now using PDF only
       if (isMixed) {
         // Mixed data: Use exportToDOCXMixed logic - generate both credit invoices and debit vouchers in one DOCX
         const docxFilename = `invoice-mixed-report-${timestamp}.docx`;
@@ -1576,11 +2110,18 @@ const detectIsDebit = (dataToCheck) => {
           const amount = getAmount(row);
           const amountInWords = numberToWords(Math.floor(amount));
           
+          // Get serial number from row data
+          const serialNoKeys = ['serialno', 'serialnumber', 'serial no', 's.no', 'sno'];
+          const serialNoKey = Object.keys(row).find(key => 
+            serialNoKeys.some(sk => key.toLowerCase().replace(/[^a-z0-9]/g, '').includes(sk.toLowerCase().replace(/[^a-z0-9]/g, '')))
+          );
+          const serialNumber = serialNoKey ? String(row[serialNoKey] || '') : '';
+          
           const dateKeys = ['date', 'txndate', 'transactiondate', 'paymentdate', 'valuedate'];
           const dateKey = Object.keys(row).find(key => 
             dateKeys.some(dk => key.toLowerCase().includes(dk.toLowerCase()))
           );
-          const invoiceDate = formatDate(row[dateKey] || new Date());
+          const invoiceDate = formatDate(row[dateKey] || null);
 
           const descKey = Object.keys(row).find(key => 
             key.toLowerCase().includes('description') || 
@@ -1604,7 +2145,7 @@ const detectIsDebit = (dataToCheck) => {
             }
           }
 
-          const invoiceNumber = generateInvoiceNumber(invoiceCounter);
+          const invoiceNumber = generateInvoiceNumber(invoiceCounter, serialNumber);
           const paymentMode = detectPaymentMode(description, row);
 
           // Credit Invoice Content
@@ -1664,7 +2205,7 @@ const detectIsDebit = (dataToCheck) => {
             new Paragraph({
               children: [
                 new TextRun({
-                  text: 'INVOICE',
+                  text: 'PAYMENT RECEIPT',
                   bold: true,
                   size: 32,
                 }),
@@ -1675,7 +2216,7 @@ const detectIsDebit = (dataToCheck) => {
             new Paragraph({
               children: [
                 new TextRun({
-                  text: 'Invoice Number: ',
+                  text: 'Payment Receipt Voucher No.: ',
                   bold: true,
                   size: 22,
                 }),
@@ -1703,12 +2244,12 @@ const detectIsDebit = (dataToCheck) => {
             new Paragraph({
               children: [
                 new TextRun({
-                  text: 'Payment Mode: ',
+                  text: 'Mode of Payment: ',
                   bold: true,
                   size: 22,
                 }),
                 new TextRun({
-                  text: paymentMode || 'UPI',
+                  text: 'UPI',
                   size: 22,
                 }),
               ],
@@ -1717,12 +2258,12 @@ const detectIsDebit = (dataToCheck) => {
             new Paragraph({
               children: [
                 new TextRun({
-                  text: 'Client / Payer: ',
+                  text: 'Received from Payer (Name and Details): ',
                   bold: true,
                   size: 22,
                 }),
                 new TextRun({
-                  text: partyName || '-',
+                  text: description || partyName || '-',
                   size: 22,
                 }),
               ],
@@ -1731,12 +2272,12 @@ const detectIsDebit = (dataToCheck) => {
             new Paragraph({
               children: [
                 new TextRun({
-                  text: 'Nature of Payment: ',
+                  text: 'Purpose of Payment: ',
                   bold: true,
                   size: 22,
                 }),
                 new TextRun({
-                  text: 'Course Fee / Lead Fee',
+                  text: 'Payment collected from students for Course/Batch',
                   size: 22,
                 }),
               ],
@@ -1745,7 +2286,7 @@ const detectIsDebit = (dataToCheck) => {
             new Paragraph({
               children: [
                 new TextRun({
-                  text: 'Total (INR): ',
+                  text: 'Amount (₹): ',
                   bold: true,
                   size: 22,
                 }),
@@ -1794,6 +2335,13 @@ const detectIsDebit = (dataToCheck) => {
         for (let i = 0; i < debitRows.length; i++) {
           const row = debitRows[i];
           
+          // Get serial number from row data
+          const serialNoKeys = ['serialno', 'serialnumber', 'serial no', 's.no', 'sno'];
+          const serialNoKey = Object.keys(row).find(key => 
+            serialNoKeys.some(sk => key.toLowerCase().replace(/[^a-z0-9]/g, '').includes(sk.toLowerCase().replace(/[^a-z0-9]/g, '')))
+          );
+          const serialNumber = serialNoKey ? String(row[serialNoKey] || '') : '';
+          
           const debitAmount = getDebitAmount(row);
           const amountInWords = numberToWords(Math.floor(debitAmount));
           
@@ -1801,7 +2349,7 @@ const detectIsDebit = (dataToCheck) => {
           const dateKey = Object.keys(row).find(key => 
             dateKeys.some(dk => key.toLowerCase().includes(dk.toLowerCase()))
           );
-          const invoiceDate = formatDate(row[dateKey] || new Date());
+          const invoiceDate = formatDate(row[dateKey] || null);
 
           const descKey = Object.keys(row).find(key => 
             key.toLowerCase().includes('description') || 
@@ -1925,6 +2473,23 @@ const detectIsDebit = (dataToCheck) => {
               ],
               spacing: { after: 200 },
             }),
+            // Serial Number - Line by line (if available)
+            ...(serialNumber ? [
+              new Paragraph({
+                children: [
+                  new TextRun({
+                    text: 'Serial Number: ',
+                    bold: true,
+                    size: 22,
+                  }),
+                  new TextRun({
+                    text: serialNumber,
+                    size: 22,
+                  }),
+                ],
+                spacing: { after: 200 },
+              }),
+            ] : []),
             new Paragraph({
               children: [
                 new TextRun({
@@ -2110,6 +2675,7 @@ const detectIsDebit = (dataToCheck) => {
           zip.file(docxFilename, docxArrayBuffer);
         }
       }
+      */ // End of old DOCX code
 
       // Generate and download ZIP file
       const zipBlob = await zip.generateAsync({ type: 'blob' });
@@ -2128,6 +2694,13 @@ const generateDOCXBlob = async (batchData, billingType, transactionType, invoice
     const row = batchData[i];
     const amount = getAmount(row);
     const amountInWords = numberToWords(Math.floor(amount));
+    
+    // Get serial number from row data
+    const serialNoKeys = ['serialno', 'serialnumber', 'serial no', 's.no', 'sno'];
+    const serialNoKey = Object.keys(row).find(key => 
+      serialNoKeys.some(sk => key.toLowerCase().replace(/[^a-z0-9]/g, '').includes(sk.toLowerCase().replace(/[^a-z0-9]/g, '')))
+    );
+    const serialNumber = serialNoKey ? String(row[serialNoKey] || '') : '';
     
     const dateKeys = ['date', 'txndate', 'transactiondate', 'paymentdate', 'valuedate'];
     const dateKey = Object.keys(row).find(key => 
@@ -2159,7 +2732,7 @@ const generateDOCXBlob = async (batchData, billingType, transactionType, invoice
 
     const isCredit = isCreditTransaction(row);
     const invoiceNumber = isCredit 
-      ? generateInvoiceNumber(invoiceCounter)
+      ? generateInvoiceNumber(invoiceCounter, serialNumber)
       : generateVoucherNumber(partyName, i, payeeNameMap);
     
     // Get Ref No
@@ -2173,9 +2746,12 @@ const generateDOCXBlob = async (batchData, billingType, transactionType, invoice
     const paymentMode = detectPaymentMode(description, refNo);
 
     if (isCredit) {
-      // INVOICE FORMAT - Line by line format
+      // PAYMENT RECEIPT FORMAT - Line by line format
+      // Get description for "Received from Payer (Name and Details)"
+      const payerDetails = description || partyName || '-';
+      
       children.push(
-        // Company Name (with page break before for new invoices)
+        // Company Name (with page break before for new receipts)
         new Paragraph({
           children: [
             new TextRun({
@@ -2186,7 +2762,7 @@ const generateDOCXBlob = async (batchData, billingType, transactionType, invoice
           ],
           alignment: AlignmentType.LEFT,
           spacing: { after: 200 },
-          pageBreakBefore: i > 0, // Start new page for each invoice except the first one
+          pageBreakBefore: i > 0, // Start new page for each receipt except the first one
         }),
         // GSTIN
         new Paragraph({
@@ -2245,11 +2821,11 @@ const generateDOCXBlob = async (batchData, billingType, transactionType, invoice
           spacing: { after: 400 },
         }),
 
-        // Invoice Title
+        // Payment Receipt Title
         new Paragraph({
           children: [
             new TextRun({
-              text: 'INVOICE',
+              text: 'PAYMENT RECEIPT',
               bold: true,
               size: 32,
             }),
@@ -2258,11 +2834,11 @@ const generateDOCXBlob = async (batchData, billingType, transactionType, invoice
           spacing: { after: 400 },
         }),
 
-        // Invoice Number - Line by line
+        // Payment Receipt Voucher No. - Line by line (ref from excel - uses serial number)
         new Paragraph({
           children: [
             new TextRun({
-              text: 'Invoice Number: ',
+              text: 'Payment Receipt Voucher No.: ',
               bold: true,
               size: 22,
             }),
@@ -2274,7 +2850,7 @@ const generateDOCXBlob = async (batchData, billingType, transactionType, invoice
           spacing: { after: 200 },
         }),
 
-        // Date - Line by line
+        // Date - Line by line (ref from excel)
         new Paragraph({
           children: [
             new TextRun({
@@ -2290,59 +2866,59 @@ const generateDOCXBlob = async (batchData, billingType, transactionType, invoice
           spacing: { after: 200 },
         }),
 
-        // Payment Mode - Line by line
+        // Mode of Payment - Line by line (default: UPI)
         new Paragraph({
           children: [
             new TextRun({
-              text: 'Payment Mode: ',
+              text: 'Mode of Payment: ',
               bold: true,
               size: 22,
             }),
             new TextRun({
-              text: paymentMode || '-',
+              text: 'UPI',
               size: 22,
             }),
           ],
           spacing: { after: 200 },
         }),
 
-        // Client / Payer - Line by line
+        // Received from Payer (Name and Details) - Line by line (ref from excel - description)
         new Paragraph({
           children: [
             new TextRun({
-              text: 'Client / Payer: ',
+              text: 'Received from Payer (Name and Details): ',
               bold: true,
               size: 22,
             }),
             new TextRun({
-              text: partyName || '-',
+              text: payerDetails,
               size: 22,
             }),
           ],
           spacing: { after: 200 },
         }),
 
-        // Nature of Payment - Always "Course Fee / Lead Fee"
+        // Purpose of Payment - Line by line (default: Payment collected from students for Course/Batch)
         new Paragraph({
           children: [
             new TextRun({
-              text: 'Nature of Payment: ',
+              text: 'Purpose of Payment: ',
               bold: true,
               size: 22,
             }),
             new TextRun({
-              text: 'Course Fee / Lead Fee',
+              text: 'Payment collected from students for Course/Batch',
               size: 22,
             }),
           ],
           spacing: { after: 200 },
         }),
 
-        // Total (INR) - Line by line
+        // Amount (₹) - Line by line (ref from excel)
         new Paragraph({
           children: [
             new TextRun({
-              text: 'Total (INR): ',
+              text: 'Amount (₹): ',
               bold: true,
               size: 22,
             }),
@@ -2355,7 +2931,7 @@ const generateDOCXBlob = async (batchData, billingType, transactionType, invoice
           spacing: { after: 400 },
         }),
 
-        // Amount in Words
+        // Amount in Words (calculated from amount)
         new Paragraph({
           children: [
             new TextRun({
@@ -2378,7 +2954,7 @@ const generateDOCXBlob = async (batchData, billingType, transactionType, invoice
           alignment: AlignmentType.LEFT,
           spacing: { before: 400, after: 400 },
         }),
-        // Page break after invoice (ensures next invoice starts on new page)
+        // Page break after receipt (ensures next receipt starts on new page)
         new Paragraph({
           children: [new TextRun({ text: '', break: 1 })],
         }),

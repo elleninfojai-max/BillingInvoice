@@ -44,14 +44,30 @@ function DataTable({ data, originalData, currentPage, totalPages, totalItems, it
   }
 
   // Get all unique keys from the data (handle both formats)
+  // Ensure Serial No appears first if it exists
   const getColumns = () => {
     if (!data || data.length === 0) return [];
     const firstItem = data[0];
+    let columns;
     // Check if data is in { row, originalIndex } format
     if (firstItem && typeof firstItem === 'object' && 'row' in firstItem) {
-      return Object.keys(firstItem.row || {});
+      columns = Object.keys(firstItem.row || {});
+    } else {
+      columns = Object.keys(firstItem || {});
     }
-    return Object.keys(firstItem || {});
+    
+    // Move Serial No to the beginning if it exists
+    const serialNoIndex = columns.findIndex(col => 
+      col.toLowerCase().replace(/[^a-z0-9]/g, '') === 'serialno' || 
+      col.toLowerCase().replace(/[^a-z0-9]/g, '') === 'serialnumber'
+    );
+    if (serialNoIndex > 0) {
+      const serialNo = columns[serialNoIndex];
+      columns.splice(serialNoIndex, 1);
+      columns.unshift(serialNo);
+    }
+    
+    return columns;
   };
   const columns = useMemo(() => getColumns(), [data]);
 

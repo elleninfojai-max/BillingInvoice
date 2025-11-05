@@ -2,7 +2,7 @@ import { useState } from 'react';
 import { Button, Box, Typography, Paper } from '@mui/material';
 import { motion } from 'framer-motion';
 import FileDownloadIcon from '@mui/icons-material/FileDownload';
-import DescriptionIcon from '@mui/icons-material/Description';
+import PictureAsPdfIcon from '@mui/icons-material/PictureAsPdf';
 
 const DownloadButtons = ({ data, billingType, selectedRows = [], onDownload }) => {
   const [isDownloading, setIsDownloading] = useState(false);
@@ -49,10 +49,10 @@ const DownloadButtons = ({ data, billingType, selectedRows = [], onDownload }) =
       color: 'from-green-500 to-green-600',
     },
     {
-      label: 'Download DOCX',
-      type: 'docx',
-      icon: DescriptionIcon,
-      color: 'from-purple-500 to-purple-600',
+      label: 'Download as PDF',
+      type: 'pdf',
+      icon: PictureAsPdfIcon,
+      color: 'from-red-500 to-red-600',
     },
   ];
 

@@ -7,9 +7,11 @@ import TransactionTypeSelector from './components/TransactionTypeSelector';
 import SummaryCards from './components/SummaryCards';
 import DataTable from './components/DataTable';
 import DownloadButtons from './components/DownloadButtons';
+import SelectedDetailsCard from './components/SelectedDetailsCard';
 import { parseFile } from './utils/fileParser';
 import { exportToCSV, exportToXLSX, exportToDOCX, exportToZIP, exportToDOCXMixed } from './utils/exportUtils';
 import { exportToDOCXDebit } from './utils/exportUtilsDebit';
+import { exportToPDF } from './utils/exportUtilsPDF';
 
 function App() {
   const [billingType, setBillingType] = useState('student');
@@ -33,7 +35,14 @@ function App() {
     setIsProcessing(true);
     try {
       const result = await parseFile(file, billingType);
-      setData(result.data);
+      
+      // Add serial number to each row
+      const dataWithSerial = result.data.map((row, index) => ({
+        ...row,
+        'Serial No': index + 1, // Add serial number starting from 1
+      }));
+      
+      setData(dataWithSerial);
       setTransactionType('all'); // Reset to show all transactions when new file is uploaded
       setCurrentPage(1); // Reset to first page
       setSelectedRows([]); // Reset selected rows
@@ -44,7 +53,7 @@ function App() {
       setEndDate(result.endDate || null);
       
       // Calculate summary with credit and debit totals
-      const { creditTotal, debitTotal, netBalance } = calculateCreditDebitTotals(result.data);
+      const { creditTotal, debitTotal, netBalance } = calculateCreditDebitTotals(dataWithSerial);
       
       setSummary({
         totalCount: result.uniqueCount,
@@ -148,6 +157,11 @@ function App() {
   const handleSelectionChange = (selectedData, selectedIndices) => {
     setSelectedRows(selectedData);
     setSelectedRowIndices(selectedIndices || new Set());
+  };
+
+  const handleClearAll = () => {
+    setSelectedRows([]);
+    setSelectedRowIndices(new Set());
   };
 
   // Helper function to detect if data contains credit or debit transactions
@@ -307,6 +321,9 @@ function App() {
         } else {
           await exportToDOCX(dataToExport, billingType, transactionType || 'all', `ellen-invoice-${timestamp}.docx`);
         }
+        break;
+      case 'pdf':
+        await exportToPDF(dataToExport, billingType, transactionType || 'all', `ellen-invoice-${timestamp}.pdf`);
         break;
       default:
         console.error('Unknown download type');
@@ -559,6 +576,12 @@ function App() {
                 billingType={billingType}
                 selectedRows={selectedRows}
                 onDownload={handleDownload}
+              />
+
+              {/* Selected Details Card */}
+              <SelectedDetailsCard
+                selectedRows={selectedRows}
+                onClearAll={handleClearAll}
               />
 
               {/* Data Table with Search and Pagination */}
