@@ -1,5 +1,6 @@
 import jsPDF from 'jspdf';
 import { saveAs } from 'file-saver';
+import logoImage from '../assets/images/logo.jpg';
 
 // Helper functions (same as exportUtils.js)
 const getAmount = (row) => {
@@ -300,43 +301,43 @@ const extractCategoryFromData = (row) => {
 
 // Load logo as base64
 const loadLogoBase64 = async () => {
-  try {
-    const logoResponse = await fetch('/src/assets/images/logo.jpg');
-    if (logoResponse.ok) {
-      const blob = await logoResponse.blob();
-      return new Promise((resolve) => {
-        const reader = new FileReader();
-        reader.onloadend = () => resolve(reader.result);
-        reader.readAsDataURL(blob);
-      });
-    }
-  } catch (error) {
+  // Try multiple paths in order of preference
+  // 1. Public folder (works in production)
+  // 2. Imported logo URL (Vite handles this)
+  // 3. Asset paths (fallback)
+  const paths = [
+    '/logo.jpg',  // Public folder - works in production
+    logoImage,    // Imported logo - Vite resolves this correctly
+    '/src/assets/images/logo.jpg',
+    '/assets/images/logo.jpg',
+    './assets/images/logo.jpg',
+    './logo.jpg'
+  ];
+  
+  for (const path of paths) {
     try {
-      const altResponse = await fetch('/assets/images/logo.jpg');
-      if (altResponse.ok) {
-        const blob = await altResponse.blob();
-        return new Promise((resolve) => {
+      if (!path) continue;
+      
+      const logoResponse = await fetch(path);
+      if (logoResponse && logoResponse.ok) {
+        const blob = await logoResponse.blob();
+        return new Promise((resolve, reject) => {
           const reader = new FileReader();
           reader.onloadend = () => resolve(reader.result);
+          reader.onerror = () => {
+            console.warn(`Failed to convert logo to base64 for path: ${path}`);
+            resolve(null);
+          };
           reader.readAsDataURL(blob);
         });
       }
     } catch (err) {
-      try {
-        const pubResponse = await fetch('/logo.jpg');
-        if (pubResponse.ok) {
-          const blob = await pubResponse.blob();
-          return new Promise((resolve) => {
-            const reader = new FileReader();
-            reader.onloadend = () => resolve(reader.result);
-            reader.readAsDataURL(blob);
-          });
-        }
-      } catch (e) {
-        console.warn('Logo not found');
-      }
+      // Continue to next path
+      continue;
     }
   }
+  
+  console.warn('Logo image not found in any path');
   return null;
 };
 
