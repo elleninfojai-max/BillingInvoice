@@ -301,38 +301,101 @@ const extractCategoryFromData = (row) => {
 
 // Load logo as base64
 const loadLogoBase64 = async () => {
-  // Try multiple paths in order of preference
-  // 1. Public folder (works in production)
-  // 2. Imported logo URL (Vite handles this)
-  // 3. Asset paths (fallback)
-  const paths = [
-    '/logo.jpg',  // Public folder - works in production
-    logoImage,    // Imported logo - Vite resolves this correctly
-    '/src/assets/images/logo.jpg',
-    '/assets/images/logo.jpg',
-    './assets/images/logo.jpg',
-    './logo.jpg'
-  ];
+  // Priority 1: Try public folder first (most reliable in production/Vercel)
+  try {
+    const publicLogoResponse = await fetch('/logo.jpg', { 
+      cache: 'no-cache',
+      credentials: 'same-origin'
+    });
+    if (publicLogoResponse && publicLogoResponse.ok) {
+      const blob = await publicLogoResponse.blob();
+      return new Promise((resolve) => {
+        const reader = new FileReader();
+        reader.onloadend = () => {
+          const result = reader.result;
+          if (result && typeof result === 'string' && result.startsWith('data:image')) {
+            resolve(result);
+          } else {
+            console.warn('Invalid logo data from public folder');
+            resolve(null);
+          }
+        };
+        reader.onerror = () => {
+          console.warn('Failed to convert public logo to base64');
+          resolve(null);
+        };
+        reader.readAsDataURL(blob);
+      });
+    }
+  } catch (error) {
+    console.warn('Error fetching public logo:', error);
+  }
   
-  for (const path of paths) {
+  // Priority 2: Try imported logo URL (Vite resolves this correctly in production)
+  if (logoImage) {
     try {
-      if (!path) continue;
-      
-      const logoResponse = await fetch(path);
+      // Vite imports return a URL string that works in production
+      // Use the imported URL directly
+      const logoResponse = await fetch(logoImage, { 
+        cache: 'no-cache',
+        credentials: 'same-origin'
+      });
       if (logoResponse && logoResponse.ok) {
         const blob = await logoResponse.blob();
-        return new Promise((resolve, reject) => {
+        return new Promise((resolve) => {
           const reader = new FileReader();
-          reader.onloadend = () => resolve(reader.result);
+          reader.onloadend = () => {
+            const result = reader.result;
+            if (result && typeof result === 'string' && result.startsWith('data:image')) {
+              resolve(result);
+            } else {
+              console.warn('Invalid logo data from imported URL');
+              resolve(null);
+            }
+          };
           reader.onerror = () => {
-            console.warn(`Failed to convert logo to base64 for path: ${path}`);
+            console.warn('Failed to convert imported logo to base64');
             resolve(null);
           };
           reader.readAsDataURL(blob);
         });
       }
+    } catch (error) {
+      console.warn('Error fetching imported logo:', error);
+    }
+  }
+  
+  // Priority 3: Try other fallback paths
+  const fallbackPaths = [
+    '/assets/images/logo.jpg',
+    './assets/images/logo.jpg',
+    '/src/assets/images/logo.jpg',
+    './logo.jpg'
+  ];
+  
+  for (const path of fallbackPaths) {
+    try {
+      const logoResponse = await fetch(path, { 
+        cache: 'no-cache',
+        credentials: 'same-origin'
+      });
+      if (logoResponse && logoResponse.ok) {
+        const blob = await logoResponse.blob();
+        return new Promise((resolve) => {
+          const reader = new FileReader();
+          reader.onloadend = () => {
+            const result = reader.result;
+            if (result && typeof result === 'string' && result.startsWith('data:image')) {
+              resolve(result);
+            } else {
+              resolve(null);
+            }
+          };
+          reader.onerror = () => resolve(null);
+          reader.readAsDataURL(blob);
+        });
+      }
     } catch (err) {
-      // Continue to next path
       continue;
     }
   }
@@ -358,8 +421,14 @@ export const exportToPDF = async (data, billingType, transactionType = 'all', fi
   const invoiceCounter = { count: 0 };
   const payeeNameMap = {};
 
-  // Load logo
+  // Load logo - ensure it's loaded before creating PDF
   const logoBase64 = await loadLogoBase64();
+  
+  if (!logoBase64) {
+    console.warn('Warning: Logo not loaded, PDF will be generated without logo');
+  } else {
+    console.log('Logo loaded successfully, length:', logoBase64.length);
+  }
 
   // Create PDF document (single document for all records)
   const pdf = new jsPDF({
@@ -498,10 +567,17 @@ export const exportToPDF = async (data, billingType, transactionType = 'all', fi
     // Header with logo and contact info
     if (logoBase64) {
       try {
-        pdf.addImage(logoBase64, 'JPEG', 20, yPos, 15, 15); // Reduced logo size from 20x20 to 15x15
+        // Ensure logoBase64 is a valid data URL
+        if (typeof logoBase64 === 'string' && logoBase64.startsWith('data:image')) {
+          pdf.addImage(logoBase64, 'JPEG', 20, yPos, 15, 15); // Reduced logo size from 20x20 to 15x15
+        } else {
+          console.warn('Invalid logo format:', typeof logoBase64);
+        }
       } catch (e) {
-        console.warn('Could not add logo image');
+        console.warn('Could not add logo image:', e);
       }
+    } else {
+      console.warn('Logo base64 is null or undefined');
     }
 
     // LEARNSCONNECT branding (positioned to avoid logo overlap, size reduced)
@@ -795,8 +871,14 @@ export const generatePDFBlob = async (data, billingType, transactionType = 'all'
   const invoiceCounter = { count: 0 };
   const payeeNameMap = {};
 
-  // Load logo
+  // Load logo - ensure it's loaded before creating PDF
   const logoBase64 = await loadLogoBase64();
+  
+  if (!logoBase64) {
+    console.warn('Warning: Logo not loaded in generatePDFBlob, PDF will be generated without logo');
+  } else {
+    console.log('Logo loaded successfully in generatePDFBlob, length:', logoBase64.length);
+  }
 
   // Create PDF document (single document for all records)
   const pdf = new jsPDF({
@@ -935,10 +1017,17 @@ export const generatePDFBlob = async (data, billingType, transactionType = 'all'
     // Header with logo and contact info (same as exportToPDF)
     if (logoBase64) {
       try {
-        pdf.addImage(logoBase64, 'JPEG', 20, yPos, 15, 15);
+        // Ensure logoBase64 is a valid data URL
+        if (typeof logoBase64 === 'string' && logoBase64.startsWith('data:image')) {
+          pdf.addImage(logoBase64, 'JPEG', 20, yPos, 15, 15);
+        } else {
+          console.warn('Invalid logo format in generatePDFBlob:', typeof logoBase64);
+        }
       } catch (e) {
-        console.warn('Could not add logo image');
+        console.warn('Could not add logo image in generatePDFBlob:', e);
       }
+    } else {
+      console.warn('Logo base64 is null or undefined in generatePDFBlob');
     }
 
     pdf.setFontSize(12);
