@@ -10,6 +10,7 @@ import {
   TableCell,
 } from 'docx';
 import { saveAs } from 'file-saver';
+import { findBeneficiaryData, getBeneficiaryField } from './excelDataLoader';
 
 // Helper function to convert number to words (Indian format)
 const convertToWords = (num) => {
@@ -96,17 +97,26 @@ const getDebitAmount = (row) => {
   return 0;
 };
 
-// Generate voucher number for debit transactions (format: ELLEN/PV/2025/01) - Sequential numbering
-const generateVoucherNumber = (voucherCounter) => {
-  // Track global voucher counter
-  if (!voucherCounter.count) {
-    voucherCounter.count = 0;
-  }
-  voucherCounter.count++;
+// Generate voucher number for debit transactions (format: ELLEN/PV/2025/(S.No)) - Using Serial No
+const generateVoucherNumber = (row) => {
+  // Try to get Serial No from row
+  const serialNoKeys = ['Serial No', 'Serial No.', 'SerialNo', 'Serial Number', 'S.No', 'S.No.', 'SNo'];
+  const serialNoKey = Object.keys(row).find(key => 
+    serialNoKeys.some(sk => key.toLowerCase().replace(/[^a-z0-9]/g, '') === sk.toLowerCase().replace(/[^a-z0-9]/g, ''))
+  );
   
-  const sequence = String(voucherCounter.count).padStart(2, '0');
+  let serialNo = '';
+  if (serialNoKey && row[serialNoKey]) {
+    serialNo = String(row[serialNoKey]).trim();
+  }
+  
   const currentYear = new Date().getFullYear();
-  return `ELLEN/PV/${currentYear}/${sequence}`;
+  if (serialNo) {
+    return `ELLEN/PV/${currentYear}/${serialNo}`;
+  }
+  
+  // Fallback to sequential numbering if Serial No not found
+  return `ELLEN/PV/${currentYear}/-`;
 };
 
 // Extract bank account number from description
@@ -145,38 +155,71 @@ const extractPayeeName = (description, row) => {
   
   if (nameKey && row[nameKey] && String(row[nameKey]).trim().length > 0) {
     partyName = String(row[nameKey]).trim();
-  } else if (description) {
-    // Extract from description - look for patterns like "Company Name / email" or "Company Name"
-    // Remove account numbers, UPI IDs, and other non-name text
-    const desc = String(description);
+    return partyName;
+  }
+  
+  if (description) {
+    const desc = String(description).trim();
     
-    // Split by common separators
-    const parts = desc.split(/[\/|,]/).map(p => p.trim());
-    
-    // Find the part that looks like a name (has letters, not just numbers/special chars)
-    for (const part of parts) {
-      const cleanPart = part.replace(/A\/c[\s]*[No\.]*[\s]*[:]*[\s]*\d+/i, '')
-                           .replace(/Account[\s]*[No\.]*[\s]*[:]*[\s]*\d+/i, '')
-                           .replace(/@\w+/g, '')
-                           .replace(/\d{10,}/g, '')
-                           .trim();
-      
-      if (cleanPart.length > 2 && /[A-Za-z]/.test(cleanPart)) {
-        partyName = cleanPart;
-        break;
+    // First, try to extract full company name before common separators
+    // Look for patterns like "COMPANY NAME /", "COMPANY NAME @", "COMPANY NAME A/c", etc.
+    const beforeSeparatorMatch = desc.match(/^([A-Z][A-Z\s&.,]+?)(?:\s*[/@|]\s*|A\/c|Account|UPI|@|\d{10,})/i);
+    if (beforeSeparatorMatch && beforeSeparatorMatch[1]) {
+      const extracted = beforeSeparatorMatch[1].trim();
+      // Check if it looks like a company name (has multiple words, contains letters)
+      const words = extracted.split(/\s+/).filter(w => /[A-Za-z]/.test(w));
+      if (words.length >= 2 && extracted.length > 5) {
+        partyName = extracted;
+        return partyName;
       }
     }
     
-    // If still not found, extract first meaningful words
+    // Split by common separators and try each part
+    const separators = /[\/|,@]/;
+    const parts = desc.split(separators).map(p => p.trim()).filter(p => p.length > 0);
+    
+    // Find the part that looks like a company name (longest meaningful text)
+    let longestPart = '';
+    for (const part of parts) {
+      const cleanPart = part
+        .replace(/A\/c[\s]*[No\.]*[\s]*[:]*[\s]*\d+/i, '')
+        .replace(/Account[\s]*[No\.]*[\s]*[:]*[\s]*\d+/i, '')
+        .replace(/@\w+/g, '')
+        .replace(/\d{10,}/g, '')
+        .replace(/UPI/i, '')
+        .replace(/RTGS|NEFT|IMPS/i, '')
+        .trim();
+      
+      // Check if it looks like a company name
+      const wordCount = cleanPart.split(/\s+/).filter(w => /[A-Za-z]/.test(w)).length;
+      if (cleanPart.length > longestPart.length && 
+          cleanPart.length > 5 && 
+          wordCount >= 2 && 
+          /[A-Za-z]/.test(cleanPart)) {
+        longestPart = cleanPart;
+      }
+    }
+    
+    if (longestPart.length > 0) {
+      partyName = longestPart;
+      return partyName;
+    }
+    
+    // Fallback: Extract first meaningful words (at least 3-4 words for company names)
     if (partyName === 'N/A') {
-      const words = description.split(/[\/\s]+/).filter(w => 
+      const words = desc.split(/[\/\s,@]+/).filter(w => 
         w.length > 2 && 
         !/^\d+$/.test(w) && 
         !/@/.test(w) &&
+        !/^upi$/i.test(w) &&
+        !/^rtgs|neft|imps$/i.test(w) &&
         /[A-Za-z]/.test(w)
       );
-      if (words.length > 0) {
-        partyName = words.slice(0, 3).join(' ').trim();
+      if (words.length >= 3) {
+        // Take first 4-5 words for company names
+        partyName = words.slice(0, 5).join(' ').trim();
+      } else if (words.length > 0) {
+        partyName = words.join(' ').trim();
       }
     }
   }
@@ -218,14 +261,7 @@ export const exportToDOCXDebit = async (data, filename = 'payment-voucher-report
       const amount = getDebitAmount(row);
       const amountInWords = numberToWords(Math.floor(amount));
       
-      // Get date from various possible column names
-      const dateKeys = ['date', 'txndate', 'transactiondate', 'paymentdate', 'valuedate'];
-      const dateKey = Object.keys(row).find(key => 
-        dateKeys.some(dk => key.toLowerCase().includes(dk.toLowerCase()))
-      );
-      const invoiceDate = formatDate(row[dateKey] || new Date());
-
-      // Get description to extract payee name and bank account
+      // Get description to extract payee name
       const descKey = Object.keys(row).find(key => 
         key.toLowerCase().includes('description') || 
         key.toLowerCase().includes('particulars') ||
@@ -236,11 +272,53 @@ export const exportToDOCXDebit = async (data, filename = 'payment-voucher-report
       // Extract payee name from description
       const partyName = extractPayeeName(description, row);
       
-      // Extract bank account from description
-      const bankAccount = extractBankAccount(description);
+      // Find matching beneficiary data from Excel
+      const beneficiaryData = await findBeneficiaryData(partyName);
+      
+      // Get date - prefer from transaction data (more accurate), fallback to Excel DB date
+      let invoiceDate = '-';
+      const dateKeys = ['date', 'txndate', 'transactiondate', 'paymentdate', 'valuedate'];
+      const dateKey = Object.keys(row).find(key => 
+        dateKeys.some(dk => key.toLowerCase().includes(dk.toLowerCase()))
+      );
+      invoiceDate = formatDate(row[dateKey] || null);
+      
+      // If no date from transaction, try Excel DB
+      if (invoiceDate === '-' && beneficiaryData) {
+        invoiceDate = getBeneficiaryField(beneficiaryData, ['Date', 'Transaction Date', 'Payment Date', 'Value Date']);
+      }
+      
+      // Final fallback to current date
+      if (invoiceDate === '-' || invoiceDate === null) {
+        invoiceDate = formatDate(new Date());
+      }
 
-      // Generate voucher number
-      const voucherNumber = generateVoucherNumber(voucherCounter);
+      // Get data from Excel or use "Refer Excel DB" as fallback
+      // Updated to use new column names from database
+      let payeeName = beneficiaryData ? getBeneficiaryField(beneficiaryData, ['Vendor Name', 'Name', 'Payee Name', 'Beneficiary Name']) : 'Refer Excel DB';
+      if (payeeName === '-') payeeName = 'Refer Excel DB';
+      
+      let bankAccountNo = beneficiaryData ? getBeneficiaryField(beneficiaryData, ['Bank A/c No.', 'Bank Account No', 'Bank Account', 'Account No', 'Account Number', 'A/c No']) : 'Refer Excel DB';
+      if (bankAccountNo === '-') bankAccountNo = 'Refer Excel DB';
+      
+      let bankNameAndDetails = beneficiaryData ? getBeneficiaryField(beneficiaryData, ['Bank Name & Branch (Verified)', 'Bank Name and Details', 'Bank Name', 'Bank Details', 'Bank']) : 'Refer Excel DB';
+      if (bankNameAndDetails === '-') bankNameAndDetails = 'Refer Excel DB';
+      
+      let purposeOfPayment = beneficiaryData ? getBeneficiaryField(beneficiaryData, ['Description', 'Purpose of Payment', 'Purpose', 'Payment Purpose']) : 'Refer Excel DB';
+      if (purposeOfPayment === '-') purposeOfPayment = 'Refer Excel DB';
+      
+      let categoryOfPayment = beneficiaryData ? getBeneficiaryField(beneficiaryData, ['Purpose / Category', 'Category of Payment', 'Category', 'Payment Category']) : 'Refer Excel DB';
+      if (categoryOfPayment === '-') categoryOfPayment = 'Refer Excel DB';
+      
+      let modeOfPayment = beneficiaryData ? getBeneficiaryField(beneficiaryData, ['Mode of Payment', 'Payment Mode', 'Mode']) : 'RTGS/NEFT';
+      
+      // If mode of payment is still '-', default to RTGS/NEFT
+      if (modeOfPayment === '-') {
+        modeOfPayment = 'RTGS/NEFT';
+      }
+
+      // Generate voucher number using Serial No
+      const voucherNumber = generateVoucherNumber(row);
 
       // PAYMENT VOUCHER FORMAT (Debit/Fees Paid to Tutors)
       children.push(
@@ -298,29 +376,17 @@ export const exportToDOCXDebit = async (data, filename = 'payment-voucher-report
           spacing: { after: 400 },
         }),
 
-        // Title: Payment Voucher / Vendor Invoice
+        // Title: Vendor Invoice
         new Paragraph({
           children: [
             new TextRun({
-              text: 'PAYMENT VOUCHER / Vendor INVOICE',
+              text: 'Vendor Invoice',
               bold: true,
               size: 32,
             }),
           ],
           alignment: AlignmentType.CENTER,
           spacing: { after: 400 },
-        }),
-
-        // Invoice Details
-        new Paragraph({
-          children: [
-            new TextRun({
-              text: 'Invoice Details:',
-              bold: true,
-              size: 24,
-            }),
-          ],
-          spacing: { after: 200 },
         }),
 
         // Voucher Details - Line by line format
@@ -340,7 +406,7 @@ export const exportToDOCXDebit = async (data, filename = 'payment-voucher-report
           spacing: { after: 200 },
         }),
 
-        // Date - Line by line
+        // Date - Line by line (from Excel)
         new Paragraph({
           children: [
             new TextRun({
@@ -356,7 +422,7 @@ export const exportToDOCXDebit = async (data, filename = 'payment-voucher-report
           spacing: { after: 200 },
         }),
 
-        // Mode of Payment - Line by line
+        // Mode of Payment - Line by line (RTGS/NEFT)
         new Paragraph({
           children: [
             new TextRun({
@@ -365,14 +431,14 @@ export const exportToDOCXDebit = async (data, filename = 'payment-voucher-report
               size: 22,
             }),
             new TextRun({
-              text: 'UPI',
+              text: modeOfPayment === '-' ? 'RTGS/NEFT' : modeOfPayment,
               size: 22,
             }),
           ],
           spacing: { after: 200 },
         }),
 
-        // Payee Name - Line by line
+        // Payee Name - Line by line (from Excel)
         new Paragraph({
           children: [
             new TextRun({
@@ -381,30 +447,46 @@ export const exportToDOCXDebit = async (data, filename = 'payment-voucher-report
               size: 22,
             }),
             new TextRun({
-              text: partyName || '-',
+              text: payeeName || '-',
               size: 22,
             }),
           ],
           spacing: { after: 200 },
         }),
 
-        // Bank Account - Line by line
+        // Bank Account No. - Line by line (from Excel)
         new Paragraph({
           children: [
             new TextRun({
-              text: 'Bank Account: ',
+              text: 'Bank Account No.: ',
               bold: true,
               size: 22,
             }),
             new TextRun({
-              text: bankAccount || '-',
+              text: bankAccountNo || '-',
               size: 22,
             }),
           ],
           spacing: { after: 200 },
         }),
 
-        // Purpose of Payment - Line by line
+        // Bank Name and Details - Line by line (from Excel)
+        new Paragraph({
+          children: [
+            new TextRun({
+              text: 'Bank Name and Details: ',
+              bold: true,
+              size: 22,
+            }),
+            new TextRun({
+              text: bankNameAndDetails || '-',
+              size: 22,
+            }),
+          ],
+          spacing: { after: 200 },
+        }),
+
+        // Purpose of Payment - Line by line (from Excel)
         new Paragraph({
           children: [
             new TextRun({
@@ -413,7 +495,23 @@ export const exportToDOCXDebit = async (data, filename = 'payment-voucher-report
               size: 22,
             }),
             new TextRun({
-              text: 'Payment collected from students is paid to tutors/institutions.',
+              text: purposeOfPayment || '-',
+              size: 22,
+            }),
+          ],
+          spacing: { after: 200 },
+        }),
+
+        // Category of Payment - Line by line (from Excel)
+        new Paragraph({
+          children: [
+            new TextRun({
+              text: 'Category of Payment: ',
+              bold: true,
+              size: 22,
+            }),
+            new TextRun({
+              text: categoryOfPayment || '-',
               size: 22,
             }),
           ],
@@ -496,12 +594,6 @@ export const generateDOCXBlobDebit = async (batchData, voucherCounter) => {
     const amount = getDebitAmount(row);
     const amountInWords = numberToWords(Math.floor(amount));
     
-    const dateKeys = ['date', 'txndate', 'transactiondate', 'paymentdate', 'valuedate'];
-    const dateKey = Object.keys(row).find(key => 
-      dateKeys.some(dk => key.toLowerCase().includes(dk.toLowerCase()))
-    );
-    const invoiceDate = formatDate(row[dateKey] || new Date());
-
     const descKey = Object.keys(row).find(key => 
       key.toLowerCase().includes('description') || 
       key.toLowerCase().includes('particulars') ||
@@ -510,8 +602,54 @@ export const generateDOCXBlobDebit = async (batchData, voucherCounter) => {
     const description = descKey ? String(row[descKey] || '') : '';
 
     const partyName = extractPayeeName(description, row);
-    const bankAccount = extractBankAccount(description);
-    const voucherNumber = generateVoucherNumber(voucherCounter);
+    
+    // Find matching beneficiary data from Excel
+    const beneficiaryData = await findBeneficiaryData(partyName);
+    
+    // Get date - prefer from transaction data (more accurate), fallback to Excel DB date
+    let invoiceDate = '-';
+    const dateKeys = ['date', 'txndate', 'transactiondate', 'paymentdate', 'valuedate'];
+    const dateKey = Object.keys(row).find(key => 
+      dateKeys.some(dk => key.toLowerCase().includes(dk.toLowerCase()))
+    );
+    invoiceDate = formatDate(row[dateKey] || null);
+    
+    // If no date from transaction, try Excel DB
+    if (invoiceDate === '-' && beneficiaryData) {
+      invoiceDate = getBeneficiaryField(beneficiaryData, ['Date', 'Transaction Date', 'Payment Date', 'Value Date']);
+    }
+    
+    // Final fallback to current date
+    if (invoiceDate === '-' || invoiceDate === null) {
+      invoiceDate = formatDate(new Date());
+    }
+
+    // Get data from Excel or use "Refer Excel DB" as fallback
+    // Updated to use new column names from database
+    let payeeName = beneficiaryData ? getBeneficiaryField(beneficiaryData, ['Vendor Name', 'Name', 'Payee Name', 'Beneficiary Name']) : 'Refer Excel DB';
+    if (payeeName === '-') payeeName = 'Refer Excel DB';
+    
+    let bankAccountNo = beneficiaryData ? getBeneficiaryField(beneficiaryData, ['Bank A/c No.', 'Bank Account No', 'Bank Account', 'Account No', 'Account Number', 'A/c No']) : 'Refer Excel DB';
+    if (bankAccountNo === '-') bankAccountNo = 'Refer Excel DB';
+    
+    let bankNameAndDetails = beneficiaryData ? getBeneficiaryField(beneficiaryData, ['Bank Name & Branch (Verified)', 'Bank Name and Details', 'Bank Name', 'Bank Details', 'Bank']) : 'Refer Excel DB';
+    if (bankNameAndDetails === '-') bankNameAndDetails = 'Refer Excel DB';
+    
+    let purposeOfPayment = beneficiaryData ? getBeneficiaryField(beneficiaryData, ['Description', 'Purpose of Payment', 'Purpose', 'Payment Purpose']) : 'Refer Excel DB';
+    if (purposeOfPayment === '-') purposeOfPayment = 'Refer Excel DB';
+    
+    let categoryOfPayment = beneficiaryData ? getBeneficiaryField(beneficiaryData, ['Purpose / Category', 'Category of Payment', 'Category', 'Payment Category']) : 'Refer Excel DB';
+    if (categoryOfPayment === '-') categoryOfPayment = 'Refer Excel DB';
+    
+    let modeOfPayment = beneficiaryData ? getBeneficiaryField(beneficiaryData, ['Mode of Payment', 'Payment Mode', 'Mode']) : 'RTGS/NEFT';
+    
+    // If mode of payment is still '-', default to RTGS/NEFT
+    if (modeOfPayment === '-') {
+      modeOfPayment = 'RTGS/NEFT';
+    }
+
+    // Generate voucher number using Serial No
+    const voucherNumber = generateVoucherNumber(row);
 
     // PAYMENT VOUCHER FORMAT
     children.push(
@@ -542,13 +680,9 @@ export const generateDOCXBlobDebit = async (batchData, voucherCounter) => {
         spacing: { after: 400 },
       }),
       new Paragraph({
-        children: [new TextRun({ text: 'PAYMENT VOUCHER / Vendor INVOICE', bold: true, size: 32 })],
+        children: [new TextRun({ text: 'Vendor Invoice', bold: true, size: 32 })],
         alignment: AlignmentType.CENTER,
         spacing: { after: 400 },
-      }),
-      new Paragraph({
-        children: [new TextRun({ text: 'Invoice Details:', bold: true, size: 24 })],
-        spacing: { after: 200 },
       }),
       // Voucher Details - Line by line format
       // Voucher No. - Line by line
@@ -566,7 +700,7 @@ export const generateDOCXBlobDebit = async (batchData, voucherCounter) => {
         ],
         spacing: { after: 200 },
       }),
-      // Date - Line by line
+      // Date - Line by line (from Excel)
       new Paragraph({
         children: [
           new TextRun({
@@ -581,7 +715,7 @@ export const generateDOCXBlobDebit = async (batchData, voucherCounter) => {
         ],
         spacing: { after: 200 },
       }),
-      // Mode of Payment - Line by line
+      // Mode of Payment - Line by line (RTGS/NEFT)
       new Paragraph({
         children: [
           new TextRun({
@@ -590,13 +724,13 @@ export const generateDOCXBlobDebit = async (batchData, voucherCounter) => {
             size: 22,
           }),
           new TextRun({
-            text: 'UPI',
+            text: modeOfPayment === '-' ? 'RTGS/NEFT' : modeOfPayment,
             size: 22,
           }),
         ],
         spacing: { after: 200 },
       }),
-      // Payee Name - Line by line
+      // Payee Name - Line by line (from Excel)
       new Paragraph({
         children: [
           new TextRun({
@@ -605,28 +739,43 @@ export const generateDOCXBlobDebit = async (batchData, voucherCounter) => {
             size: 22,
           }),
           new TextRun({
-            text: partyName || '-',
+            text: payeeName || '-',
             size: 22,
           }),
         ],
         spacing: { after: 200 },
       }),
-      // Bank Account - Line by line
+      // Bank Account No. - Line by line (from Excel)
       new Paragraph({
         children: [
           new TextRun({
-            text: 'Bank Account: ',
+            text: 'Bank Account No.: ',
             bold: true,
             size: 22,
           }),
           new TextRun({
-            text: bankAccount || '-',
+            text: bankAccountNo || '-',
             size: 22,
           }),
         ],
         spacing: { after: 200 },
       }),
-      // Purpose of Payment - Line by line
+      // Bank Name and Details - Line by line (from Excel)
+      new Paragraph({
+        children: [
+          new TextRun({
+            text: 'Bank Name and Details: ',
+            bold: true,
+            size: 22,
+          }),
+          new TextRun({
+            text: bankNameAndDetails || '-',
+            size: 22,
+          }),
+        ],
+        spacing: { after: 200 },
+      }),
+      // Purpose of Payment - Line by line (from Excel)
       new Paragraph({
         children: [
           new TextRun({
@@ -635,7 +784,22 @@ export const generateDOCXBlobDebit = async (batchData, voucherCounter) => {
             size: 22,
           }),
           new TextRun({
-            text: 'Payment collected from students is paid to tutors/institutions.',
+            text: purposeOfPayment || '-',
+            size: 22,
+          }),
+        ],
+        spacing: { after: 200 },
+      }),
+      // Category of Payment - Line by line (from Excel)
+      new Paragraph({
+        children: [
+          new TextRun({
+            text: 'Category of Payment: ',
+            bold: true,
+            size: 22,
+          }),
+          new TextRun({
+            text: categoryOfPayment || '-',
             size: 22,
           }),
         ],

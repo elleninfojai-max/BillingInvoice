@@ -1,6 +1,7 @@
 import jsPDF from 'jspdf';
 import { saveAs } from 'file-saver';
 import logoImage from '../assets/images/logo.jpg';
+import { findBeneficiaryData, getBeneficiaryField } from './excelDataLoader';
 
 // Helper functions (same as exportUtils.js)
 const getAmount = (row) => {
@@ -72,6 +73,40 @@ const formatDate = (dateStr) => {
     return '-';
   }
   return String(dateStr);
+};
+
+// Extract clean payer name from UPI transaction description
+const extractPayerNameFromUPI = (description) => {
+  if (!description) return null;
+  
+  const desc = String(description).trim();
+  
+  // Pattern for UPI transactions: BY TRANSFER-UPI/CR/number/NAME/bank/phone/...
+  // The name appears after /CR/number/ and before the next /
+  const upiPattern = /BY\s+TRANSFER-UPI\/CR\/\d+\/([^\/]+)\//i;
+  const match = desc.match(upiPattern);
+  
+  if (match && match[1]) {
+    // Clean up the extracted name
+    let cleanName = match[1].trim();
+    
+    // Remove any extra whitespace
+    cleanName = cleanName.replace(/\s+/g, ' ');
+    
+    // Capitalize properly (handle cases like "AJAY BHA" or "Master K")
+    cleanName = cleanName.split(' ')
+      .map(word => {
+        if (word.length === 0) return '';
+        // Keep words like "K" as is, capitalize first letter for others
+        if (word.length === 1) return word.toUpperCase();
+        return word.charAt(0).toUpperCase() + word.slice(1).toLowerCase();
+      })
+      .join(' ');
+    
+    return cleanName;
+  }
+  
+  return null;
 };
 
 const extractSerialNumberSequence = (serialNumber) => {
@@ -440,7 +475,11 @@ export const exportToPDF = async (data, billingType, transactionType = 'all', fi
   const pageWidth = pdf.internal.pageSize.getWidth();
   const pageHeight = pdf.internal.pageSize.getHeight();
 
-  // Process each record
+  // Array to store invoice numbers for filename generation
+  const invoiceNumbers = [];
+  let generatedFilename = filename;
+
+    // Process each record
   for (let i = 0; i < data.length; i++) {
     const row = data[i];
     const amount = getAmount(row);
@@ -496,7 +535,7 @@ export const exportToPDF = async (data, billingType, transactionType = 'all', fi
     
     const description = descKey ? String(row[descKey] || '').trim() : '';
 
-    // Extract party name
+    // Extract party name - improved extraction to get full company name
     let partyName = 'N/A';
     const nameKeys = ['name', 'partyname', 'client', 'payer', 'studentname', 'payeename', 'vendorname'];
     const nameKey = Object.keys(row).find(key => 
@@ -506,26 +545,124 @@ export const exportToPDF = async (data, billingType, transactionType = 'all', fi
     if (nameKey && row[nameKey] && String(row[nameKey]).trim().length > 0) {
       partyName = String(row[nameKey]).trim();
     } else if (description) {
-      const words = description.split(/[\/\s]+/).filter(w => w.length > 2 && !/^\d+$/.test(w));
-      if (words.length > 0) {
-        partyName = words.slice(0, 3).join(' ').trim();
+      const desc = String(description).trim();
+      
+      // First, try to extract full company name before common separators
+      const beforeSeparatorMatch = desc.match(/^([A-Z][A-Z\s&.,]+?)(?:\s*[/@|]\s*|A\/c|Account|UPI|@|\d{10,})/i);
+      if (beforeSeparatorMatch && beforeSeparatorMatch[1]) {
+        const extracted = beforeSeparatorMatch[1].trim();
+        const words = extracted.split(/\s+/).filter(w => /[A-Za-z]/.test(w));
+        if (words.length >= 2 && extracted.length > 5) {
+          partyName = extracted;
+        }
+      }
+      
+      // If not found, split by separators and find longest meaningful part
+      if (partyName === 'N/A') {
+        const separators = /[\/|,@]/;
+        const parts = desc.split(separators).map(p => p.trim()).filter(p => p.length > 0);
+        
+        let longestPart = '';
+        for (const part of parts) {
+          const cleanPart = part
+            .replace(/A\/c[\s]*[No\.]*[\s]*[:]*[\s]*\d+/i, '')
+            .replace(/Account[\s]*[No\.]*[\s]*[:]*[\s]*\d+/i, '')
+            .replace(/@\w+/g, '')
+            .replace(/\d{10,}/g, '')
+            .replace(/UPI/i, '')
+            .replace(/RTGS|NEFT|IMPS/i, '')
+            .trim();
+          
+          const wordCount = cleanPart.split(/\s+/).filter(w => /[A-Za-z]/.test(w)).length;
+          if (cleanPart.length > longestPart.length && 
+              cleanPart.length > 5 && 
+              wordCount >= 2 && 
+              /[A-Za-z]/.test(cleanPart)) {
+            longestPart = cleanPart;
+          }
+        }
+        
+        if (longestPart.length > 0) {
+          partyName = longestPart;
+        } else {
+          // Fallback: Extract first meaningful words
+          const words = desc.split(/[\/\s,@]+/).filter(w => 
+            w.length > 2 && 
+            !/^\d+$/.test(w) && 
+            !/@/.test(w) &&
+            !/^upi$/i.test(w) &&
+            !/^rtgs|neft|imps$/i.test(w) &&
+            /[A-Za-z]/.test(w)
+          );
+          if (words.length >= 3) {
+            partyName = words.slice(0, 5).join(' ').trim();
+          } else if (words.length > 0) {
+            partyName = words.join(' ').trim();
+          }
+        }
       }
     }
 
     const isCredit = isCreditTransaction(row);
     
-    // For debit transactions, use serial number in voucher number
+    // For debit transactions, fetch data from Excel and use serial number in voucher number
     let invoiceNumber;
-    if (isCredit) {
-      invoiceNumber = generateInvoiceNumber(invoiceCounter, serialNumber);
-    } else {
+    let beneficiaryData = null;
+    let payeeName = '-';
+    let invoiceDateFromExcel = invoiceDate;
+    let modeOfPayment = 'RTGS/NEFT';
+    let bankAccountNo = '-';
+    let bankNameAndDetails = '-';
+    let purposeOfPayment = '-';
+    let categoryOfPayment = '-';
+    
+    if (!isCredit) {
+      // Find matching beneficiary data from Excel
+      beneficiaryData = await findBeneficiaryData(partyName);
+      
+      // Get date - prefer from transaction data (more accurate), fallback to Excel DB date
+      invoiceDateFromExcel = invoiceDate; // Use transaction date by default
+      
+      // Only use Excel DB date if transaction date is not available
+      if ((!invoiceDate || invoiceDate === '-') && beneficiaryData) {
+        invoiceDateFromExcel = getBeneficiaryField(beneficiaryData, ['Date', 'Transaction Date', 'Payment Date', 'Value Date']);
+        if (invoiceDateFromExcel === '-') {
+          invoiceDateFromExcel = invoiceDate || formatDate(new Date());
+        }
+      }
+      
+      // Get all other fields from Excel
+      // Updated to use new column names from database
+      payeeName = beneficiaryData ? getBeneficiaryField(beneficiaryData, ['Vendor Name', 'Name', 'Payee Name', 'Beneficiary Name']) : '-';
+      if (payeeName === '-') payeeName = '-';
+      
+      modeOfPayment = beneficiaryData ? getBeneficiaryField(beneficiaryData, ['Mode of Payment', 'Payment Mode', 'Mode']) : 'RTGS/NEFT';
+      if (modeOfPayment === '-') modeOfPayment = 'RTGS/NEFT';
+      
+      bankAccountNo = beneficiaryData ? getBeneficiaryField(beneficiaryData, ['Bank A/c No.', 'Bank Account No', 'Bank Account', 'Account No', 'Account Number', 'A/c No']) : '-';
+      if (bankAccountNo === '-') bankAccountNo = '-';
+      
+      bankNameAndDetails = beneficiaryData ? getBeneficiaryField(beneficiaryData, ['Bank Name & Branch (Verified)', 'Bank Name and Details', 'Bank Name', 'Bank Details', 'Bank']) : '-';
+      if (bankNameAndDetails === '-') bankNameAndDetails = '-';
+      
+      purposeOfPayment = beneficiaryData ? getBeneficiaryField(beneficiaryData, ['Description', 'Purpose of Payment', 'Purpose', 'Payment Purpose']) : '-';
+      if (purposeOfPayment === '-') purposeOfPayment = '-';
+      
+      categoryOfPayment = beneficiaryData ? getBeneficiaryField(beneficiaryData, ['Purpose / Category', 'Category of Payment', 'Category', 'Payment Category']) : '-';
+      if (categoryOfPayment === '-') categoryOfPayment = '-';
+      
       // For vendor invoice, use format: ELLEN/PV/2025/(serial number)
       const year = new Date().getFullYear();
       const serialSequence = extractSerialNumberSequence(serialNumber);
       invoiceNumber = serialSequence 
         ? `ELLEN/PV/${year}/${serialSequence}`
         : generateVoucherNumber(partyName, i, payeeNameMap);
+    } else {
+      invoiceNumber = generateInvoiceNumber(invoiceCounter, serialNumber);
     }
+
+    // Store invoice number for filename generation
+    invoiceNumbers.push(invoiceNumber);
 
     const refKeys = ['refno', 'refno', 'ref', 'chequeno', 'utrno', 'utr', 'branchcode'];
     const refKey = Object.keys(row).find(key => 
@@ -534,28 +671,6 @@ export const exportToPDF = async (data, billingType, transactionType = 'all', fi
     let refNo = refKey ? String(row[refKey] || '') : '';
     
     const paymentMode = detectPaymentMode(description, refNo);
-    
-    // Get vendor details from database
-    const vendorDetails = getVendorDetails(partyName);
-    
-    // Extract bank account and bank name from data or vendor database
-    let bankAccount = extractBankAccountFromData(row, description);
-    let bankName = extractBankNameFromData(row, description);
-    
-    // Use vendor database if available
-    if (vendorDetails) {
-      bankAccount = bankAccount || vendorDetails.bankAccount;
-      bankName = bankName || vendorDetails.bankName;
-    }
-    
-    // Extract category from data or vendor database
-    let category = extractCategoryFromData(row);
-    if (vendorDetails && !category) {
-      category = vendorDetails.category;
-    }
-    
-    // Use description from vendor database if available, otherwise use row description
-    const finalDescription = vendorDetails ? vendorDetails.description : description;
 
     // Add new page if not first record
     if (i > 0) {
@@ -638,7 +753,7 @@ export const exportToPDF = async (data, billingType, transactionType = 'all', fi
     if (isCredit) {
       pdf.text('LearnsConnect – Payment Receipt', pageWidth / 2, yPos, { align: 'center' });
     } else {
-      pdf.text('LearnsConnect - Vendor Invoice', pageWidth / 2, yPos, { align: 'center' });
+      pdf.text('Vendor Invoice', pageWidth / 2, yPos, { align: 'center' });
     }
     yPos += 18; // Increased spacing before content
 
@@ -713,9 +828,12 @@ export const exportToPDF = async (data, billingType, transactionType = 'all', fi
       // Mode of Payment
       drawTableRow('Mode of Payment:', 'UPI', true, false);
 
-      // Received from Payer
-      const payerDetails = description || partyName || '-';
-      drawTableRow('Received from Payer (Name and Details):', payerDetails, true, false, true);
+      // Received from Payer - Extract clean name from UPI description
+      let payerDetails = extractPayerNameFromUPI(description);
+      if (!payerDetails) {
+        payerDetails = partyName || description || '-';
+      }
+      drawTableRow('Received from Payer:', payerDetails, true, false, true);
 
       // Purpose of Payment
       drawTableRow('Purpose of Payment:', 'Payment collected from students for Course/Batch', true, false, true);
@@ -812,16 +930,16 @@ export const exportToPDF = async (data, billingType, transactionType = 'all', fi
 
               // Vendor Invoice fields
               drawTableRow('Voucher No.:', invoiceNumber || '-', true, false);
-              drawTableRow('Date:', invoiceDate || '-', true, false);
-              drawTableRow('Mode of Payment:', paymentMode || 'RTGS/NEFT', true, false);
-              drawTableRow('Bank Account No:', bankAccount || '-', true, false);
-              drawTableRow('Bank Name and Details:', bankName || '-', true, false);
-              // Purpose of Payment - always use default value
-              const purposeText = 'Payment collected from students is paid to tutors/institutions';
-              drawTableRow('Purpose of Payment:', purposeText, true, false, true);
+              drawTableRow('Date:', invoiceDateFromExcel || '-', true, false);
+              drawTableRow('Mode of Payment:', modeOfPayment, true, false);
+              drawTableRow('Payee Name:', payeeName, true, false);
+              drawTableRow('Bank Account No:', bankAccountNo, true, false);
+              drawTableRow('Bank Name and Details:', bankNameAndDetails, true, false);
+              drawTableRow('Purpose of Payment:', purposeOfPayment, true, false, true);
+              drawTableRow('Category of Payment:', categoryOfPayment, true, false);
       const amountText = `INR ${amount.toLocaleString('en-IN', { minimumFractionDigits: 2, maximumFractionDigits: 2 })}`;
       drawTableRow('Amount (INR):', amountText, true, true);
-      drawTableRow('Amount in Words:', amountInWords, true, false, true);
+      drawTableRow('Amount in Words:', `Rupees ${amountInWords} Only`, true, false, true);
       
       yPos += 10; // Extra spacing after main table
       
@@ -848,7 +966,15 @@ export const exportToPDF = async (data, billingType, transactionType = 'all', fi
 
     // Save PDF after processing all records
     if (i === data.length - 1) {
-      pdf.save(filename);
+      // Generate filename based on invoice numbers
+      if (invoiceNumbers.length === 1) {
+        // Single invoice - use the invoice number
+        generatedFilename = `${invoiceNumbers[0].replace(/\//g, '-')}.pdf`;
+      } else if (invoiceNumbers.length > 1) {
+        // Multiple invoices - use first and last invoice numbers
+        generatedFilename = `${invoiceNumbers[0].replace(/\//g, '-')}_to_${invoiceNumbers[invoiceNumbers.length - 1].replace(/\//g, '-')}.pdf`;
+      }
+      pdf.save(generatedFilename);
       window.pdfDoc = null; // Clean up
     }
   }
@@ -889,6 +1015,9 @@ export const generatePDFBlob = async (data, billingType, transactionType = 'all'
 
   const pageWidth = pdf.internal.pageSize.getWidth();
   const pageHeight = pdf.internal.pageSize.getHeight();
+
+  // Array to store invoice numbers for filename generation
+  const invoiceNumbers = [];
 
   // Process each record (same logic as exportToPDF)
   for (let i = 0; i < data.length; i++) {
@@ -946,7 +1075,7 @@ export const generatePDFBlob = async (data, billingType, transactionType = 'all'
     
     const description = descKey ? String(row[descKey] || '').trim() : '';
 
-    // Extract party name
+    // Extract party name - improved extraction to get full company name
     let partyName = 'N/A';
     const nameKeys = ['name', 'partyname', 'client', 'payer', 'studentname', 'payeename', 'vendorname'];
     const nameKey = Object.keys(row).find(key => 
@@ -956,26 +1085,124 @@ export const generatePDFBlob = async (data, billingType, transactionType = 'all'
     if (nameKey && row[nameKey] && String(row[nameKey]).trim().length > 0) {
       partyName = String(row[nameKey]).trim();
     } else if (description) {
-      const words = description.split(/[\/\s]+/).filter(w => w.length > 2 && !/^\d+$/.test(w));
-      if (words.length > 0) {
-        partyName = words.slice(0, 3).join(' ').trim();
+      const desc = String(description).trim();
+      
+      // First, try to extract full company name before common separators
+      const beforeSeparatorMatch = desc.match(/^([A-Z][A-Z\s&.,]+?)(?:\s*[/@|]\s*|A\/c|Account|UPI|@|\d{10,})/i);
+      if (beforeSeparatorMatch && beforeSeparatorMatch[1]) {
+        const extracted = beforeSeparatorMatch[1].trim();
+        const words = extracted.split(/\s+/).filter(w => /[A-Za-z]/.test(w));
+        if (words.length >= 2 && extracted.length > 5) {
+          partyName = extracted;
+        }
+      }
+      
+      // If not found, split by separators and find longest meaningful part
+      if (partyName === 'N/A') {
+        const separators = /[\/|,@]/;
+        const parts = desc.split(separators).map(p => p.trim()).filter(p => p.length > 0);
+        
+        let longestPart = '';
+        for (const part of parts) {
+          const cleanPart = part
+            .replace(/A\/c[\s]*[No\.]*[\s]*[:]*[\s]*\d+/i, '')
+            .replace(/Account[\s]*[No\.]*[\s]*[:]*[\s]*\d+/i, '')
+            .replace(/@\w+/g, '')
+            .replace(/\d{10,}/g, '')
+            .replace(/UPI/i, '')
+            .replace(/RTGS|NEFT|IMPS/i, '')
+            .trim();
+          
+          const wordCount = cleanPart.split(/\s+/).filter(w => /[A-Za-z]/.test(w)).length;
+          if (cleanPart.length > longestPart.length && 
+              cleanPart.length > 5 && 
+              wordCount >= 2 && 
+              /[A-Za-z]/.test(cleanPart)) {
+            longestPart = cleanPart;
+          }
+        }
+        
+        if (longestPart.length > 0) {
+          partyName = longestPart;
+        } else {
+          // Fallback: Extract first meaningful words
+          const words = desc.split(/[\/\s,@]+/).filter(w => 
+            w.length > 2 && 
+            !/^\d+$/.test(w) && 
+            !/@/.test(w) &&
+            !/^upi$/i.test(w) &&
+            !/^rtgs|neft|imps$/i.test(w) &&
+            /[A-Za-z]/.test(w)
+          );
+          if (words.length >= 3) {
+            partyName = words.slice(0, 5).join(' ').trim();
+          } else if (words.length > 0) {
+            partyName = words.join(' ').trim();
+          }
+        }
       }
     }
 
     const isCredit = isCreditTransaction(row);
     
-    // For debit transactions, use serial number in voucher number
+    // For debit transactions, fetch data from Excel and use serial number in voucher number
     let invoiceNumber;
-    if (isCredit) {
-      invoiceNumber = generateInvoiceNumber(invoiceCounter, serialNumber);
-    } else {
+    let beneficiaryData = null;
+    let payeeName = '-';
+    let invoiceDateFromExcel = invoiceDate;
+    let modeOfPayment = 'RTGS/NEFT';
+    let bankAccountNo = '-';
+    let bankNameAndDetails = '-';
+    let purposeOfPayment = '-';
+    let categoryOfPayment = '-';
+    
+    if (!isCredit) {
+      // Find matching beneficiary data from Excel
+      beneficiaryData = await findBeneficiaryData(partyName);
+      
+      // Get date - prefer from transaction data (more accurate), fallback to Excel DB date
+      invoiceDateFromExcel = invoiceDate; // Use transaction date by default
+      
+      // Only use Excel DB date if transaction date is not available
+      if ((!invoiceDate || invoiceDate === '-') && beneficiaryData) {
+        invoiceDateFromExcel = getBeneficiaryField(beneficiaryData, ['Date', 'Transaction Date', 'Payment Date', 'Value Date']);
+        if (invoiceDateFromExcel === '-') {
+          invoiceDateFromExcel = invoiceDate || formatDate(new Date());
+        }
+      }
+      
+      // Get all other fields from Excel
+      // Updated to use new column names from database
+      payeeName = beneficiaryData ? getBeneficiaryField(beneficiaryData, ['Vendor Name', 'Name', 'Payee Name', 'Beneficiary Name']) : '-';
+      if (payeeName === '-') payeeName = '-';
+      
+      modeOfPayment = beneficiaryData ? getBeneficiaryField(beneficiaryData, ['Mode of Payment', 'Payment Mode', 'Mode']) : 'RTGS/NEFT';
+      if (modeOfPayment === '-') modeOfPayment = 'RTGS/NEFT';
+      
+      bankAccountNo = beneficiaryData ? getBeneficiaryField(beneficiaryData, ['Bank A/c No.', 'Bank Account No', 'Bank Account', 'Account No', 'Account Number', 'A/c No']) : '-';
+      if (bankAccountNo === '-') bankAccountNo = '-';
+      
+      bankNameAndDetails = beneficiaryData ? getBeneficiaryField(beneficiaryData, ['Bank Name & Branch (Verified)', 'Bank Name and Details', 'Bank Name', 'Bank Details', 'Bank']) : '-';
+      if (bankNameAndDetails === '-') bankNameAndDetails = '-';
+      
+      purposeOfPayment = beneficiaryData ? getBeneficiaryField(beneficiaryData, ['Description', 'Purpose of Payment', 'Purpose', 'Payment Purpose']) : '-';
+      if (purposeOfPayment === '-') purposeOfPayment = '-';
+      
+      categoryOfPayment = beneficiaryData ? getBeneficiaryField(beneficiaryData, ['Purpose / Category', 'Category of Payment', 'Category', 'Payment Category']) : '-';
+      if (categoryOfPayment === '-') categoryOfPayment = '-';
+      
       // For vendor invoice, use format: ELLEN/PV/2025/(serial number)
       const year = new Date().getFullYear();
       const serialSequence = extractSerialNumberSequence(serialNumber);
       invoiceNumber = serialSequence 
         ? `ELLEN/PV/${year}/${serialSequence}`
         : generateVoucherNumber(partyName, i, payeeNameMap);
+    } else {
+      invoiceNumber = generateInvoiceNumber(invoiceCounter, serialNumber);
     }
+
+    // Store invoice number for filename generation
+    invoiceNumbers.push(invoiceNumber);
 
     const refKeys = ['refno', 'refno', 'ref', 'chequeno', 'utrno', 'utr', 'branchcode'];
     const refKey = Object.keys(row).find(key => 
@@ -984,28 +1211,6 @@ export const generatePDFBlob = async (data, billingType, transactionType = 'all'
     let refNo = refKey ? String(row[refKey] || '') : '';
     
     const paymentMode = detectPaymentMode(description, refNo);
-    
-    // Get vendor details from database
-    const vendorDetails = getVendorDetails(partyName);
-    
-    // Extract bank account and bank name from data or vendor database
-    let bankAccount = extractBankAccountFromData(row, description);
-    let bankName = extractBankNameFromData(row, description);
-    
-    // Use vendor database if available
-    if (vendorDetails) {
-      bankAccount = bankAccount || vendorDetails.bankAccount;
-      bankName = bankName || vendorDetails.bankName;
-    }
-    
-    // Extract category from data or vendor database
-    let category = extractCategoryFromData(row);
-    if (vendorDetails && !category) {
-      category = vendorDetails.category;
-    }
-    
-    // Use description from vendor database if available, otherwise use row description
-    const finalDescription = vendorDetails ? vendorDetails.description : description;
 
     // Add new page if not first record
     if (i > 0) {
@@ -1076,7 +1281,7 @@ export const generatePDFBlob = async (data, billingType, transactionType = 'all'
     if (isCredit) {
       pdf.text('LearnsConnect – Payment Receipt', pageWidth / 2, yPos, { align: 'center' });
     } else {
-      pdf.text('LearnsConnect - Vendor Invoice', pageWidth / 2, yPos, { align: 'center' });
+      pdf.text('Vendor Invoice', pageWidth / 2, yPos, { align: 'center' });
     }
     yPos += 18;
 
@@ -1131,8 +1336,11 @@ export const generatePDFBlob = async (data, billingType, transactionType = 'all'
       drawTableRow('Payment Receipt Voucher No.:', invoiceNumber || '-', true, false);
       drawTableRow('Date:', invoiceDate || '-', true, false);
       drawTableRow('Mode of Payment:', 'UPI', true, false);
-      const payerDetails = description || partyName || '-';
-      drawTableRow('Received from Payer (Name and Details):', payerDetails, true, false, true);
+      let payerDetails = extractPayerNameFromUPI(description);
+      if (!payerDetails) {
+        payerDetails = partyName || description || '-';
+      }
+      drawTableRow('Received from Payer:', payerDetails, true, false, true);
       drawTableRow('Purpose of Payment:', 'Payment collected from students for Course/Batch', true, false, true);
       const amountText = `INR ${amount.toLocaleString('en-IN', { minimumFractionDigits: 2, maximumFractionDigits: 2 })}`;
       drawTableRow('Amount (INR):', amountText, true, true);
@@ -1203,15 +1411,16 @@ export const generatePDFBlob = async (data, billingType, transactionType = 'all'
       };
 
       drawTableRow('Voucher No.:', invoiceNumber || '-', true, false);
-      drawTableRow('Date:', invoiceDate || '-', true, false);
-      drawTableRow('Mode of Payment:', paymentMode || 'RTGS/NEFT', true, false);
-      drawTableRow('Bank Account No:', bankAccount || '-', true, false);
-      drawTableRow('Bank Name and Details:', bankName || '-', true, false);
-      const purposeText = 'Payment collected from students is paid to tutors/institutions';
-      drawTableRow('Purpose of Payment:', purposeText, true, false, true);
+      drawTableRow('Date:', invoiceDateFromExcel || '-', true, false);
+      drawTableRow('Mode of Payment:', modeOfPayment, true, false);
+      drawTableRow('Payee Name:', payeeName, true, false);
+      drawTableRow('Bank Account No:', bankAccountNo, true, false);
+      drawTableRow('Bank Name and Details:', bankNameAndDetails, true, false);
+      drawTableRow('Purpose of Payment:', purposeOfPayment, true, false, true);
+      drawTableRow('Category of Payment:', categoryOfPayment, true, false);
       const amountText = `INR ${amount.toLocaleString('en-IN', { minimumFractionDigits: 2, maximumFractionDigits: 2 })}`;
       drawTableRow('Amount (INR):', amountText, true, true);
-      drawTableRow('Amount in Words:', amountInWords, true, false, true);
+      drawTableRow('Amount in Words:', `Rupees ${amountInWords} Only`, true, false, true);
       
       yPos += 10;
       

@@ -11,7 +11,7 @@ import SelectedDetailsCard from './components/SelectedDetailsCard';
 import { parseFile } from './utils/fileParser';
 import { exportToCSV, exportToXLSX, exportToDOCX, exportToZIP, exportToDOCXMixed } from './utils/exportUtils';
 import { exportToDOCXDebit } from './utils/exportUtilsDebit';
-import { exportToPDF } from './utils/exportUtilsPDF';
+import { exportToPDF, generatePDFBlob } from './utils/exportUtilsPDF';
 
 function App() {
   const [billingType, setBillingType] = useState('student');
@@ -162,6 +162,31 @@ function App() {
   const handleClearAll = () => {
     setSelectedRows([]);
     setSelectedRowIndices(new Set());
+  };
+
+  // Preview selected rows as PDF in a new tab
+  const handleViewSelected = async () => {
+    try {
+      if (!selectedRows || selectedRows.length === 0) {
+        alert('Please select at least one record to view');
+        return;
+      }
+
+      const arrayBuffer = await generatePDFBlob(selectedRows, billingType, transactionType || 'all');
+      if (!arrayBuffer) {
+        alert('Unable to generate PDF preview');
+        return;
+      }
+
+      const blob = new Blob([arrayBuffer], { type: 'application/pdf' });
+      const url = URL.createObjectURL(blob);
+      window.open(url, '_blank', 'noopener,noreferrer');
+      // Revoke after a minute to free memory
+      setTimeout(() => URL.revokeObjectURL(url), 60 * 1000);
+    } catch (err) {
+      console.error('Error generating PDF preview:', err);
+      alert('Error generating PDF preview');
+    }
   };
 
   // Helper function to detect if data contains credit or debit transactions
@@ -582,6 +607,7 @@ function App() {
               <SelectedDetailsCard
                 selectedRows={selectedRows}
                 onClearAll={handleClearAll}
+                onView={handleViewSelected}
               />
 
               {/* Data Table with Search and Pagination */}

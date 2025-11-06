@@ -2,8 +2,9 @@ import { motion } from 'framer-motion';
 import { Paper, Typography, Box, Button } from '@mui/material';
 import CheckCircleIcon from '@mui/icons-material/CheckCircle';
 import ClearIcon from '@mui/icons-material/Clear';
+import VisibilityIcon from '@mui/icons-material/Visibility';
 
-const SelectedDetailsCard = ({ selectedRows, onClearAll }) => {
+const SelectedDetailsCard = ({ selectedRows, onClearAll, onView }) => {
   if (!selectedRows || selectedRows.length === 0) {
     return null;
   }
@@ -46,6 +47,23 @@ const SelectedDetailsCard = ({ selectedRows, onClearAll }) => {
               Selected: {selectedRows.length} {selectedRows.length === 1 ? 'Record' : 'Records'}
             </Typography>
           </Box>
+          <Box sx={{ display: 'flex', alignItems: 'center', gap: 1 }}>
+            <Button
+              variant="contained"
+              startIcon={<VisibilityIcon />}
+              onClick={onView}
+              sx={{
+                backgroundColor: '#7c3aed',
+                '&:hover': { backgroundColor: '#6d28d9' },
+                fontWeight: 600,
+                px: 3,
+                py: 1,
+                borderRadius: '12px',
+                textTransform: 'none',
+              }}
+            >
+              View
+            </Button>
           <Button
             variant="outlined"
             startIcon={<ClearIcon />}
@@ -66,6 +84,7 @@ const SelectedDetailsCard = ({ selectedRows, onClearAll }) => {
           >
             Clear All
           </Button>
+          </Box>
         </Box>
       </Paper>
     </motion.div>
