@@ -1,8 +1,8 @@
 import { motion } from 'framer-motion';
-import { Box, Typography } from '@mui/material';
+import { Box, Button, Typography } from '@mui/material';
 import logoImage from '../assets/images/logo.jpg';
 
-const Navbar = () => {
+const Navbar = ({ isAuthenticated = false, onLogout }) => {
   return (
     <motion.nav
       initial={{ y: -100, opacity: 0 }}
@@ -98,13 +98,33 @@ const Navbar = () => {
         {/* Spacer to balance the layout - Only on larger screens */}
         <Box
           sx={{
-            width: { xs: 0, sm: '50px' },
-            flexShrink: 0,
-            visibility: { xs: 'hidden', sm: 'visible' },
-            opacity: 0,
-            height: '50px',
+            display: 'flex',
+            alignItems: 'center',
+            gap: 1,
           }}
-        />
+        >
+          {isAuthenticated && (
+            <Button
+              variant="contained"
+              onClick={onLogout}
+              sx={{
+                borderRadius: '12px',
+                background: 'linear-gradient(135deg, #667eea 0%, #764ba2 100%)',
+                boxShadow: '0 10px 20px rgba(102, 126, 234, 0.2)',
+                fontWeight: 600,
+                textTransform: 'none',
+                px: 2.5,
+                py: 0.75,
+                '&:hover': {
+                  background: 'linear-gradient(135deg, #5a67d8 0%, #6b46c1 100%)',
+                  boxShadow: '0 12px 24px rgba(102, 126, 234, 0.25)',
+                },
+              }}
+            >
+              Logout
+            </Button>
+          )}
+        </Box>
       </Box>
     </motion.nav>
   );

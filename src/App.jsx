@@ -3,6 +3,7 @@ import { motion } from 'framer-motion';
 import Navbar from './components/Navbar';
 import Footer from './components/Footer';
 import UploadSection from './components/UploadSection';
+import LoginForm from './components/LoginForm';
 import TransactionTypeSelector from './components/TransactionTypeSelector';
 import SummaryCards from './components/SummaryCards';
 import DataTable from './components/DataTable';
@@ -14,6 +15,13 @@ import { exportToDOCXDebit } from './utils/exportUtilsDebit';
 import { exportToPDF, generatePDFBlob } from './utils/exportUtilsPDF';
 
 function App() {
+  const AUTH_STORAGE_KEY = 'invoiceGen:isAuthenticated';
+  const [isAuthenticated, setIsAuthenticated] = useState(() => {
+    if (typeof window !== 'undefined') {
+      return localStorage.getItem(AUTH_STORAGE_KEY) === 'true';
+    }
+    return false;
+  });
   const [billingType, setBillingType] = useState('student');
   const [data, setData] = useState(null);
   const [isProcessing, setIsProcessing] = useState(false);
@@ -30,6 +38,47 @@ function App() {
   const [transactionType, setTransactionType] = useState('all'); // 'all', 'credit', or 'debit'
   const [currentPage, setCurrentPage] = useState(1);
   const [itemsPerPage] = useState(100); // Number of items per page
+
+  const handleLoginSubmit = ({ username, password }) => {
+    const expectedUsername = import.meta.env.VITE_USERNAME ?? '';
+    const expectedPassword = import.meta.env.VITE_PASSWORD ?? '';
+
+    if (!expectedUsername || !expectedPassword) {
+      console.warn('Missing login credentials. Please ensure VITE_USERNAME and VITE_PASSWORD are set in the environment.');
+      return {
+        success: false,
+        message: 'Login is currently unavailable. Please contact the administrator.',
+      };
+    }
+
+    if (username === expectedUsername && password === expectedPassword) {
+      setIsAuthenticated(true);
+      if (typeof window !== 'undefined') {
+        localStorage.setItem(AUTH_STORAGE_KEY, 'true');
+      }
+      return { success: true };
+    }
+
+    return {
+      success: false,
+      message: 'Invalid username or password.',
+    };
+  };
+
+  const handleLogout = () => {
+    setIsAuthenticated(false);
+    setData(null);
+    setSummary({ totalCount: 0, creditTotal: 0, debitTotal: 0, netBalance: 0 });
+    setSelectedRows([]);
+    setSelectedRowIndices(new Set());
+    setStartDate(null);
+    setEndDate(null);
+    setTransactionType('all');
+    setCurrentPage(1);
+    if (typeof window !== 'undefined') {
+      localStorage.removeItem(AUTH_STORAGE_KEY);
+    }
+  };
 
   const handleFileUpload = async (file) => {
     setIsProcessing(true);
@@ -561,7 +610,7 @@ function App() {
       />
       
       <div style={{ position: 'relative', zIndex: 1, minHeight: '100vh', display: 'flex', flexDirection: 'column' }}>
-        <Navbar />
+        <Navbar isAuthenticated={isAuthenticated} onLogout={handleLogout} />
         
         <main className="flex-1 container mx-auto px-4 sm:px-6 lg:px-8 py-6 sm:py-8 max-w-7xl">
           <motion.div
@@ -569,94 +618,100 @@ function App() {
             animate={{ opacity: 1 }}
             transition={{ duration: 0.5 }}
           >
-          {/* Upload Section */}
-          <UploadSection
-            onFileUpload={handleFileUpload}
-            onBillingTypeChange={handleBillingTypeChange}
-            billingType={billingType}
-            isProcessing={isProcessing}
-          />
-
-          {/* Transaction Type Selector - Always visible after file upload */}
-          {data && data.length > 0 && (
-            <TransactionTypeSelector
-              onSelect={handleTransactionTypeSelect}
-              selectedType={transactionType}
-            />
-          )}
-
-          {/* Summary Cards */}
-          {data && data.length > 0 && (
+          {isAuthenticated ? (
             <>
-              <SummaryCards
-                totalCount={summary.totalCount}
-                creditTotal={summary.creditTotal}
-                debitTotal={summary.debitTotal}
-                netBalance={summary.netBalance}
-              />
-
-              {/* Download Buttons */}
-              <DownloadButtons
-                data={getFilteredData() || data}
+              {/* Upload Section */}
+              <UploadSection
+                onFileUpload={handleFileUpload}
+                onBillingTypeChange={handleBillingTypeChange}
                 billingType={billingType}
-                selectedRows={selectedRows}
-                onDownload={handleDownload}
+                isProcessing={isProcessing}
               />
 
-              {/* Selected Details Card */}
-              <SelectedDetailsCard
-                selectedRows={selectedRows}
-                onClearAll={handleClearAll}
-                onView={handleViewSelected}
-              />
+              {/* Transaction Type Selector - Always visible after file upload */}
+              {data && data.length > 0 && (
+                <TransactionTypeSelector
+                  onSelect={handleTransactionTypeSelect}
+                  selectedType={transactionType}
+                />
+              )}
 
-              {/* Data Table with Search and Pagination */}
-              {(() => {
-                const filteredData = getFilteredData() || data || [];
-                const totalItems = filteredData.length;
-
-                return (
-                  <DataTable
-                    data={filteredData}
-                    originalData={data}
-                    currentPage={currentPage}
-                    totalPages={Math.max(1, Math.ceil(totalItems / itemsPerPage))}
-                    totalItems={totalItems}
-                    itemsPerPage={itemsPerPage}
-                    onPageChange={setCurrentPage}
-                    selectedRowIndices={selectedRowIndices}
-                    onSelectionChange={handleSelectionChange}
+              {/* Summary Cards */}
+              {data && data.length > 0 && (
+                <>
+                  <SummaryCards
+                    totalCount={summary.totalCount}
+                    creditTotal={summary.creditTotal}
+                    debitTotal={summary.debitTotal}
+                    netBalance={summary.netBalance}
                   />
-                );
-              })()}
-            </>
-          )}
 
-          {/* Empty State */}
-          {!data && !isProcessing && (
-            <motion.div
-              initial={{ opacity: 0 }}
-              animate={{ opacity: 1 }}
-              style={{
-                textAlign: 'center',
-                padding: '3rem 1rem',
-                background: 'rgba(255, 255, 255, 0.9)',
-                backdropFilter: 'blur(25px)',
-                WebkitBackdropFilter: 'blur(25px)',
-                border: '1px solid rgba(255, 255, 255, 0.6)',
-                boxShadow: '0 8px 32px 0 rgba(31, 38, 135, 0.2)',
-                borderRadius: '20px',
-              }}
-            >
-              <p style={{ 
-                color: '#666666', 
-                fontSize: '1.125rem',
-                fontWeight: 500,
-                margin: 0,
-              }}>
-                Upload a file to get started
-              </p>
-            </motion.div>
+                  {/* Download Buttons */}
+                  <DownloadButtons
+                    data={getFilteredData() || data}
+                    billingType={billingType}
+                    selectedRows={selectedRows}
+                    onDownload={handleDownload}
+                  />
+
+                  {/* Selected Details Card */}
+                  <SelectedDetailsCard
+                    selectedRows={selectedRows}
+                    onClearAll={handleClearAll}
+                    onView={handleViewSelected}
+                  />
+
+                  {/* Data Table with Search and Pagination */}
+                  {(() => {
+                    const filteredData = getFilteredData() || data || [];
+                    const totalItems = filteredData.length;
+
+                    return (
+                      <DataTable
+                        data={filteredData}
+                        originalData={data}
+                        currentPage={currentPage}
+                        totalPages={Math.max(1, Math.ceil(totalItems / itemsPerPage))}
+                        totalItems={totalItems}
+                        itemsPerPage={itemsPerPage}
+                        onPageChange={setCurrentPage}
+                        selectedRowIndices={selectedRowIndices}
+                        onSelectionChange={handleSelectionChange}
+                      />
+                    );
+                  })()}
+                </>
+              )}
+
+              {/* Empty State */}
+              {!data && !isProcessing && (
+                <motion.div
+                  initial={{ opacity: 0 }}
+                  animate={{ opacity: 1 }}
+                  style={{
+                    textAlign: 'center',
+                    padding: '3rem 1rem',
+                    background: 'rgba(255, 255, 255, 0.9)',
+                    backdropFilter: 'blur(25px)',
+                    WebkitBackdropFilter: 'blur(25px)',
+                    border: '1px solid rgba(255, 255, 255, 0.6)',
+                    boxShadow: '0 8px 32px 0 rgba(31, 38, 135, 0.2)',
+                    borderRadius: '20px',
+                  }}
+                >
+                  <p style={{ 
+                    color: '#666666', 
+                    fontSize: '1.125rem',
+                    fontWeight: 500,
+                    margin: 0,
+                  }}>
+                    Upload a file to get started
+                  </p>
+                </motion.div>
+              )}
+            </>
+          ) : (
+            <LoginForm onSubmit={handleLoginSubmit} />
           )}
           </motion.div>
         </main>
